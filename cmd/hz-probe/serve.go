@@ -85,20 +85,30 @@ func runServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go agent.Loop(ctx)
 
 	// Push mode: report to hz and do not listen at all. Nothing has to reach
 	// this host, so there is no port to open, no certificate to serve and no
 	// address to keep stable.
 	if f.pushMode() {
+		// Before the probe loop starts: this recovers the target set and the
+		// unacknowledged backlog a previous process left, so a restart (or an
+		// auto-update) resumes at the oldest uncommitted result instead of
+		// opening a hole where that process died.
+		agent.EnablePushSpool()
+		go agent.Loop(ctx)
+
 		pusher := &probe.Pusher{URL: f.pushTo, Token: tok}
 		held := agent.Targets()
+		backlog := agent.SpoolStats()
 		slog.Info("hz-probe reporting to hz",
 			"hz", f.pushTo, "vantage", f.vantageName(), "version", Version,
-			"targets", len(held.Targets), "targets_version", held.Version)
+			"targets", len(held.Targets), "targets_version", held.Version,
+			"backlog", backlog.Pending, "state", backlog.State)
 		agent.PushLoop(ctx, pusher, 0)
 		return nil
 	}
+
+	go agent.Loop(ctx)
 
 	srv := &http.Server{
 		Addr:              f.listen,

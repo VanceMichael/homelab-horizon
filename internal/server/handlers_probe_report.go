@@ -87,19 +87,34 @@ func (s *Server) handleProbeReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accepted := s.monitor.AcceptPushedResults(rp, req.Vantage, req.Version, req.Results)
+	// Commit before fold: the monitor durably records the result identities
+	// first, so a retry folds nothing twice. A failure here must answer
+	// non-2xx with no acknowledgement — the agent keeps its spool and retries
+	// rather than deciding the batch was delivered on guesswork.
+	receipt, err := s.monitor.ReceivePush(rp, req.Vantage, req.Version, req.Results, req.Spool)
+	if err != nil {
+		slog.Error("probe: could not commit a pushed report",
+			"vantage", rp.Name, "results", len(req.Results), "error", err)
+		writeJSONError(w, http.StatusServiceUnavailable,
+			"hz could not commit this report; the agent should keep it queued and retry")
+		return
+	}
 
 	// Same version handshake as pull, from the other side: hz sends the set
 	// only when the agent is holding a different one.
 	want := s.monitor.TargetSetFor(rp)
 	resp := probe.PushResponse{
-		Accepted:       accepted,
+		// Accepted keeps its old meaning for an older agent: every submitted
+		// result is now held (newly folded or already known).
+		Accepted:       len(req.Results),
+		AckIDs:         receipt.AckIDs,
 		TargetsVersion: want.Version,
 		Interval:       rp.Probe,
 		// The embedded agent binaries are cross-compiled in the same build as
 		// this server and carry the same version string, so what hz is
 		// running is exactly what it would hand out.
 		AgentVersion: s.version,
+		Notice:       receipt.Notice,
 	}
 	if req.TargetsVersion != want.Version {
 		set := want

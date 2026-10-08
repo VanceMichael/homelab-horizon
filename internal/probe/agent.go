@@ -44,6 +44,11 @@ type Agent struct {
 	// slowest target's timeout, so any fixed delay either races it or wastes
 	// time, and racing it means fresh results sit unsent for a full interval.
 	probed chan struct{}
+
+	// pushSpool is the durable backlog a pushing agent records into and acks
+	// against. When nil — pull mode, or push without a state path — the agent
+	// uses the in-memory ring below, exactly as before.
+	pushSpool *spool
 }
 
 // persisted is the agent's on-disk state: the target set, and nothing about
@@ -113,15 +118,40 @@ func (a *Agent) saveState(ts TargetSet) {
 	}
 }
 
+// EnablePushSpool turns on the durable backlog for a pushing agent. It must
+// be called before the probe loop starts: it recovers both the cached target
+// set and every result a previous process had not had acknowledged, so the
+// first report after a restart resumes at the oldest uncommitted boundary
+// rather than at the empty ring a fresh process would otherwise have.
+//
+// With no state path the spool is in-memory and reports no durability state:
+// the same stateless operation an agent without a --state flag always had.
+func (a *Agent) EnablePushSpool() {
+	sp := newSpool(a.statePath)
+	a.mu.Lock()
+	a.pushSpool = sp
+	a.targets = sp.Targets()
+	a.results = nil
+	a.mu.Unlock()
+}
+
 // SetTargets installs a target set and wakes the probe loop.
 func (a *Agent) SetTargets(ts TargetSet) {
 	if ts.Version == "" {
 		ts.Version = ts.ComputeVersion()
 	}
-	a.mu.Lock()
-	a.targets = ts
-	a.mu.Unlock()
-	a.saveState(ts)
+	if a.pushSpool != nil {
+		// Same file, same lifecycle as the backlog: a restart that keeps
+		// pending results keeps the targets that produced them too.
+		if err := a.pushSpool.SetTargets(ts); err != nil {
+			slog.Warn("probe: target set not persisted yet", "error", err)
+		}
+	} else {
+		a.mu.Lock()
+		a.targets = ts
+		a.mu.Unlock()
+		a.saveState(ts)
+	}
 	select {
 	case a.wake <- struct{}{}:
 	default:
@@ -130,20 +160,40 @@ func (a *Agent) SetTargets(ts TargetSet) {
 
 // Targets returns the installed set.
 func (a *Agent) Targets() TargetSet {
+	if a.pushSpool != nil {
+		return a.pushSpool.Targets()
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.targets
 }
 
-// Record appends results to the ring buffer, as the probe loop does. Exported
-// so a caller that produces results another way can feed the same buffer.
+// Record appends results to the buffer the report path drains — the durable
+// spool in push mode, the in-memory ring otherwise — as the probe loop does.
+// Exported so a caller that produces results another way can feed the same
+// buffer.
 func (a *Agent) Record(rs []Result) {
+	if a.pushSpool != nil {
+		if err := a.pushSpool.Append(rs); err != nil {
+			slog.Warn("probe: results buffered but not yet persisted", "error", err, "count", len(rs))
+		}
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.results = append(a.results, rs...)
 	if len(a.results) > maxBuffered {
 		a.results = a.results[len(a.results)-maxBuffered:]
 	}
+}
+
+// SpoolStats reports the durable backlog's depth and health. A pull agent or
+// a stateless push agent reports the zero value (empty state).
+func (a *Agent) SpoolStats() SpoolStats {
+	if a.pushSpool != nil {
+		return a.pushSpool.Stats()
+	}
+	return SpoolStats{}
 }
 
 // Since returns buffered results newer than t, oldest first, capped at limit.
@@ -212,6 +262,15 @@ func (a *Agent) RunOnce(ctx context.Context) []Result {
 // The push loop selects on it so a report follows a round rather than a
 // clock.
 func (a *Agent) Probed() <-chan struct{} { return a.probed }
+
+// SignalProbedForTest fires the same notification a real probe round would,
+// so tests feeding results via Record can drive PushLoop without probing.
+func (a *Agent) SignalProbedForTest() {
+	select {
+	case a.probed <- struct{}{}:
+	default:
+	}
+}
 
 // Loop probes on the target set's interval until ctx is done. It keeps
 // running whether or not hz ever polls; the buffer is what makes an hz

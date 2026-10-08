@@ -31,6 +31,16 @@ type RemoteState struct {
 	AgentVersion   string    `json:"agent_version,omitempty"`
 	TargetsVersion string    `json:"targets_version,omitempty"`
 	TargetCount    int       `json:"target_count"`
+
+	// The agent's durable backlog, as of its latest report. These make the
+	// failure modes the commit loop cannot hide visible: a backlog still
+	// draining after an outage, results retention had to discard, and a state
+	// file the agent cannot write. Empty on an older agent.
+	SpoolPending  int       `json:"spool_pending,omitempty"`
+	SpoolCap      int       `json:"spool_cap,omitempty"`
+	SpoolDropped  int64     `json:"spool_dropped,omitempty"`
+	SpoolOldestAt time.Time `json:"spool_oldest_at,omitempty"`
+	SpoolState    string    `json:"spool_state,omitempty"`
 }
 
 // defaultPollInterval is how often hz asks an agent what it has seen.
@@ -126,6 +136,13 @@ func (m *Monitor) ReloadRemotes(cfg *config.Config) {
 		next, still := after[name]
 		if !still || !sameRemoteProbe(old, next) {
 			m.stopRemoteProbe(name)
+			// Only an actual deletion removes the delivery journal: the
+			// result identities an edit or a token rotation touches are the
+			// same vantage's. A rename migrates the journal explicitly in the
+			// rename path before this reload sees the old name as gone.
+			if !still {
+				m.pushLog.Remove(name)
+			}
 		}
 	}
 
@@ -571,14 +588,56 @@ func (m *Monitor) upsertExternal(row externalRow) {
 // agent reads as every one of its targets frozen on its last good result,
 // which is the failure mode the agent row exists to prevent in either mode.
 
-// AcceptPushedResults folds one report into the check rows and returns how
-// many results were taken.
+// PushReceipt is what one report became. The handler turns AckIDs into the
+// wire acknowledgement; nothing else needs its internals.
+type PushReceipt struct {
+	// AckIDs is every submitted identity hz now holds — fresh and duplicate
+	// alike. The agent may delete all of them.
+	AckIDs []string
+
+	// Fresh is how many were folded for the first time. Duplicate deliveries
+	// still prove reachability; they change no check state.
+	Fresh int
+
+	// Notice carries a non-routine condition for the agent to log verbatim.
+	Notice string
+}
+
+// ReceivePush commits one push report: identities persist before anything
+// folds, and only what folded once affects a check, its history or an alert.
 //
-// The count matters: the agent drops exactly what hz acknowledges and
-// retries the rest, so an over-count silently loses results and an
-// under-count duplicates them.
-func (m *Monitor) AcceptPushedResults(rp config.RemoteProbe, agentVantage, agentVersion string, results []probe.Result) int {
+// A report whose results hz already holds — a retry whose first answer was
+// lost, or an overlap across an hz restart — folds nothing, but still marks
+// the vantage reachable: the authenticated delivery is itself a fresh
+// liveness fact, exactly as a poll is in pull mode.
+//
+// A journal write error is returned with no fold and no acknowledgement. The
+// agent retries with its spool intact, so a full disk delays rather than
+// duplicates or loses.
+func (m *Monitor) ReceivePush(rp config.RemoteProbe, agentVantage, agentVersion string, results []probe.Result, spool *probe.SpoolStats) (PushReceipt, error) {
+	ids := make([]string, len(results))
+	for i, r := range results {
+		ids[i] = probe.ResultIdentity(r)
+	}
+
+	// Commit first. On failure nothing folds and nothing is acked.
+	committed, err := m.pushLog.Commit(rp.Name, ids)
+	if err != nil {
+		return PushReceipt{}, err
+	}
+
+	// Fold only the first occurrence of each newly-held identity, in the
+	// order the agent submitted them.
+	fresh := make(map[string]bool, len(committed.Fresh))
+	for _, id := range committed.Fresh {
+		fresh[id] = true
+	}
 	for _, r := range results {
+		id := probe.ResultIdentity(r)
+		if !fresh[id] {
+			continue
+		}
+		delete(fresh, id) // a duplicated id within one batch folds once
 		m.foldRemoteResult(rp, r)
 	}
 
@@ -599,13 +658,40 @@ func (m *Monitor) AcceptPushedResults(rp config.RemoteProbe, agentVantage, agent
 	st.AgentVantage = agentVantage
 	st.AgentVersion = agentVersion
 	st.TargetCount = len(m.publicTargets())
+	if spool != nil {
+		st.SpoolPending = spool.Pending
+		st.SpoolCap = spool.Cap
+		st.SpoolDropped = spool.DroppedTotal
+		if spool.OldestAt != nil {
+			st.SpoolOldestAt = *spool.OldestAt
+		} else {
+			st.SpoolOldestAt = time.Time{}
+		}
+		st.SpoolState = spool.State
+	} else {
+		st.SpoolPending, st.SpoolCap, st.SpoolDropped = 0, 0, 0
+		st.SpoolOldestAt = time.Time{}
+		st.SpoolState = ""
+	}
 	m.mu.Unlock()
 
 	// The agent row reports that hz heard from it, which in push mode is the
-	// only reachability fact there is.
+	// only reachability fact there is. Every successful delivery heartbeats,
+	// including a batch whose results were all already known.
 	m.recordAgentStatus(rp, nil)
 	m.pruneVantageRows(rp, m.remoteTargetSet(rp))
-	return len(results)
+
+	return PushReceipt{AckIDs: committed.Held, Fresh: len(committed.Fresh), Notice: committed.Notice}, nil
+}
+
+// RenamePushJournal carries a vantage's delivered-identity record to its new
+// name, so an edit that renames the vantage does not reset de-duplication.
+// Called before the config reload that makes the old name vanish.
+func (m *Monitor) RenamePushJournal(oldName, newName string) {
+	if oldName == "" || oldName == newName {
+		return
+	}
+	m.pushLog.Rename(oldName, newName)
 }
 
 // pruneVantageRows drops a vantage's check rows for targets it is no longer

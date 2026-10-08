@@ -78,6 +78,14 @@ func (s *Server) handleAPIRemotes(w http.ResponseWriter, r *http.Request) {
 				st.AgentVersion != s.version
 			item.TargetsVersion = st.TargetsVersion
 			item.TargetCount = st.TargetCount
+			item.SpoolPending = st.SpoolPending
+			item.SpoolCap = st.SpoolCap
+			item.SpoolDropped = st.SpoolDropped
+			if !st.SpoolOldestAt.IsZero() {
+				oldest := st.SpoolOldestAt
+				item.SpoolOldestAt = &oldest
+			}
+			item.SpoolState = st.SpoolState
 		}
 		out = append(out, item)
 	}
@@ -232,6 +240,12 @@ func (s *Server) handleAPIRemoteUpdate(w http.ResponseWriter, r *http.Request) {
 	if !found {
 		writeJSONError(w, http.StatusNotFound, "Vantage not found")
 		return
+	}
+	// Carry the delivery journal across a rename before the reload sees the
+	// old name vanish; otherwise the rename would reset de-duplication and
+	// let in-flight reports fold twice.
+	if req.Name != target {
+		s.monitor.RenamePushJournal(target, req.Name)
 	}
 	s.monitor.ReloadRemotes(s.cfg())
 

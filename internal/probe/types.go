@@ -81,6 +81,13 @@ func (ts TargetSet) ComputeVersion() string {
 
 // Result is one probe of one target, from the agent's vantage.
 type Result struct {
+	// ID is the result's stable identity, assigned when the result is
+	// produced and kept for its whole life: it rides the spool across agent
+	// restarts and is what hz acknowledges, so a retried report is the same
+	// result rather than a second one. Empty only on a wire from an older
+	// agent, where hz identifies the result by its contents instead.
+	ID string `json:"id,omitempty"`
+
 	Target    string    `json:"target"`
 	Host      string    `json:"host"`
 	Kind      string    `json:"kind"`
@@ -89,6 +96,78 @@ type Result struct {
 	LatencyMS int64     `json:"latency_ms"`
 	Detail    string    `json:"detail,omitempty"`
 	Error     string    `json:"error,omitempty"`
+}
+
+// Spool state, as the agent sees its own durable backlog. Empty State means
+// the agent is running without a state file: there is no durability to be
+// degraded, so hz renders nothing rather than a warning.
+const (
+	SpoolStateOK       = "ok"       // pending results are durably stored
+	SpoolStateDegraded = "degraded" // a write failed; the backlog currently lives only in memory
+	SpoolStateCorrupt  = "corrupt"  // the state file was unreadable; it was quarantined
+)
+
+// SpoolStats is the agent's backlog as of the report carrying it. It is how
+// an operator sees the two situations the commit loop cannot hide: a backlog
+// still draining after an outage, and results the retention cap had to drop.
+type SpoolStats struct {
+	// Pending is results produced but not yet acknowledged by hz.
+	Pending int `json:"pending"`
+
+	// Cap is the entry bound retention trims against.
+	Cap int `json:"cap,omitempty"`
+
+	// DroppedTotal is how many unacknowledged results the retention cap has
+	// discarded, oldest first, over this agent's life. Persisted with the
+	// spool, so it survives the restart that followed the drop.
+	DroppedTotal int64 `json:"dropped_total,omitempty"`
+
+	// OldestAt is the oldest still-pending result's probe time — the age of
+	// what hz has not yet been told. A pointer so an empty backlog emits
+	// nothing at all instead of Go's year-zero timestamp.
+	OldestAt *time.Time `json:"oldest_at,omitempty"`
+
+	// State is ok/degraded/corrupt; empty when the agent runs stateless.
+	State string `json:"state,omitempty"`
+}
+
+// ResultIdentity is the key hz dedupes on. A result carrying its own ID is
+// identified by it; a result from an older agent that has none falls back to
+// a deterministic hash of its contents, so the same bytes retried are still
+// recognised as the result hz already holds.
+func ResultIdentity(r Result) string {
+	if r.ID != "" {
+		return r.ID
+	}
+	// A fixed field order (struct, not map) makes the hash stable; it covers
+	// exactly the wire facts, so any changed byte changes the identity.
+	c := struct {
+		Target    string    `json:"target"`
+		Host      string    `json:"host"`
+		Kind      string    `json:"kind"`
+		At        time.Time `json:"at"`
+		Status    string    `json:"status"`
+		LatencyMS int64     `json:"latency_ms"`
+		Detail    string    `json:"detail"`
+		Error     string    `json:"error"`
+	}{
+		Target:    r.Target,
+		Host:      r.Host,
+		Kind:      r.Kind,
+		At:        r.At,
+		Status:    r.Status,
+		LatencyMS: r.LatencyMS,
+		Detail:    r.Detail,
+		Error:     r.Error,
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		// A struct of strings, ints and one time cannot make encoding/json
+		// fail; a non-identity is the safe answer if that ever changed.
+		return "unidentifiable"
+	}
+	sum := sha256.Sum256(b)
+	return "c:" + hex.EncodeToString(sum[:16])
 }
 
 // PollRequest is hz asking what the agent has seen.
@@ -129,6 +208,11 @@ type PushRequest struct {
 	// Buffered says more results are waiting past this batch, so hz knows to
 	// expect another report immediately rather than on the next interval.
 	Buffered bool `json:"buffered,omitempty"`
+
+	// Spool reports the durable backlog behind this batch: its depth, its
+	// oldest result, what retention has had to drop, and whether the state
+	// file is healthy. Absent on an older agent.
+	Spool *SpoolStats `json:"spool,omitempty"`
 }
 
 // PushResponse is hz acknowledging a report.
@@ -136,7 +220,18 @@ type PushResponse struct {
 	// Accepted is how many results hz took. The agent drops exactly these
 	// from its buffer — anything it did not acknowledge is retried, so a
 	// half-processed report does not lose data.
+	//
+	// Kept for an older agent that does not understand AckIDs: it advances
+	// its timestamp watermark by the count as it always did. A current agent
+	// ignores this in favour of AckIDs.
 	Accepted int `json:"accepted"`
+
+	// AckIDs names exactly which submitted results hz now holds — whether
+	// newly folded or already there from a report whose answer was lost. The
+	// agent removes precisely these from its durable spool; a partial list
+	// leaves the rest for the next report. Identity, not count, is what makes
+	// the acknowledgement safe when batches overlap across a restart.
+	AckIDs []string `json:"ack_ids,omitempty"`
 
 	// Targets is sent when the agent's version does not match what hz wants
 	// it probing. Same mechanism as pull, same hash.

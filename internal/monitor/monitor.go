@@ -136,10 +136,26 @@ type Monitor struct {
 	// take effect without restarting every check and discarding the history
 	// of services that did not change.
 	checkCancel map[string]context.CancelFunc
+
+	// pushLog holds the delivered-result identities of push vantages, so a
+	// retried report folds nothing twice. Persisted when a root directory is
+	// configured; otherwise in-memory.
+	pushLog *pushJournal
+}
+
+// Option customises a Monitor at construction.
+type Option func(*Monitor)
+
+// WithPushJournalRoot enables persisted push de-duplication under dir. An
+// empty dir selects the in-memory journal (dry-run and tests).
+func WithPushJournalRoot(dir string) Option {
+	return func(m *Monitor) {
+		m.pushLog = newPushJournal(dir)
+	}
 }
 
 // New creates a new Monitor
-func New(cfg *config.Config) *Monitor {
+func New(cfg *config.Config, opts ...Option) *Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Monitor{
 		statuses: make(map[string]*CheckStatus),
@@ -149,6 +165,10 @@ func New(cfg *config.Config) *Monitor {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		pushLog: newPushJournal(""),
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 	m.config.Store(cfg)
 	return m

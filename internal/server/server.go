@@ -427,8 +427,17 @@ func NewWithConfig(cfg *config.Config, configPath string, dryRun bool, version s
 		HAProxyCertDir: cfg.SSLHAProxyCertDir,
 	})
 
-	// Initialize service monitor
-	mon := monitor.New(cfg)
+	// Initialize service monitor. The push de-duplication journal lives
+	// beside the other durable gateway state: hz must remember which pushed
+	// results it already holds across its own restarts, or a retried report
+	// after a crash folds its checks and alerts twice. Dry-run stays
+	// in-memory because it changes nothing on disk.
+	monOpts := []monitor.Option{}
+	if !dryRun {
+		journalDir := filepath.Join(filepath.Dir(cfg.UsersDBPath()), "push")
+		monOpts = append(monOpts, monitor.WithPushJournalRoot(journalDir))
+	}
+	mon := monitor.New(cfg, monOpts...)
 
 	s := &Server{
 		configPath:     configPath,

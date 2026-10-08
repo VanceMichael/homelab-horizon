@@ -562,6 +562,15 @@ type RemoteProbeResp struct {
 	TargetsVersion       string `json:"targetsVersion,omitempty"`
 	TargetCount          int    `json:"targetCount"`
 	CheckCount           int    `json:"checkCount"` // check rows this vantage contributes
+
+	// The agent's durable send backlog, as of its latest report. Zero/empty
+	// on a healthy or older agent; non-zero signals an outage still draining,
+	// retention drops, or a state file the agent cannot write.
+	SpoolPending  int        `json:"spoolPending,omitempty"`
+	SpoolCap      int        `json:"spoolCap,omitempty"`
+	SpoolDropped  int64      `json:"spoolDropped,omitempty"`
+	SpoolOldestAt *time.Time `json:"spoolOldestAt,omitempty"`
+	SpoolState    string     `json:"spoolState,omitempty"` // "", "ok", "degraded", "corrupt"
 }
 
 // RemoteProbeRequest adds or edits a vantage.

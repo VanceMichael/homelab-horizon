@@ -87,35 +87,52 @@ func (p *Pusher) Report(ctx context.Context, req PushRequest) (*PushResponse, er
 
 // PushLoop reports to hz on an interval until ctx is done.
 //
-// Results are dropped from the buffer only once hz says it took them, so a
+// Results are dropped from the buffer only once hz says it holds them, so a
 // failed report is retried rather than lost — which is what makes an hz
-// outage a delay instead of a hole.
+// outage a delay instead of a hole. With the durable spool enabled, "holds
+// them" is an identity hz persisted before answering, so an agent restart
+// between sending and hearing the answer simply retries: hz dedupes what it
+// already has and acks again, and nothing is either lost or double-folded.
 func (a *Agent) PushLoop(ctx context.Context, p *Pusher, interval time.Duration) {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
 
-	// sent is the watermark of what hz has acknowledged.
+	// sent is the timestamp watermark, used only by the stateless ring.
 	var sent time.Time
 
 	for {
 		next := interval
 
-		results, more := a.Since(sent, pushBatchLimit)
+		var results []Result
+		var more bool
+		var spoolStats *SpoolStats
+		pendingBefore := 0
+		if sp := a.pushSpool; sp != nil {
+			var st SpoolStats
+			results, more, st = sp.Batch(pushBatchLimit)
+			pendingBefore = st.Pending
+			spoolStats = &st
+		} else {
+			results, more = a.Since(sent, pushBatchLimit)
+		}
 		held := a.Targets()
 
-		resp, err := p.Report(ctx, PushRequest{
+		req := PushRequest{
 			Vantage:        a.vantage,
 			Version:        a.version,
 			TargetsVersion: held.Version,
 			Results:        results,
 			Buffered:       more,
-		})
+			Spool:          spoolStats,
+		}
+		resp, err := p.Report(ctx, req)
 		switch {
 		case err != nil:
-			// Keep the watermark where it is; the batch goes again next time.
+			// Keep every marker where it is: the spool still holds the batch
+			// and it goes again next time.
 			slog.Warn("probe: could not report to hz",
-				"error", err, "buffered", len(results))
+				"error", err, "buffered", len(results), "backlog", pendingBefore)
 		default:
 			if resp.Targets != nil {
 				a.SetTargets(*resp.Targets)
@@ -133,16 +150,43 @@ func (a *Agent) PushLoop(ctx context.Context, p *Pusher, interval time.Duration)
 			if resp.Notice != "" {
 				slog.Warn("probe: notice from hz", "notice", resp.Notice)
 			}
-			// Advance only over what hz acknowledged.
-			if resp.Accepted > 0 && resp.Accepted <= len(results) {
-				sent = results[resp.Accepted-1].At
+
+			progressed := false
+			if sp := a.pushSpool; sp != nil {
+				// Identity-based acknowledgement is the precise path. The
+				// count fallback is an older hz answering a new agent during
+				// a rolling upgrade.
+				switch {
+				case len(resp.AckIDs) > 0:
+					if err := sp.Ack(resp.AckIDs); err != nil {
+						slog.Warn("probe: acknowledgement not recorded locally; batch will retry",
+							"error", err, "ids", len(resp.AckIDs))
+					}
+				case resp.Accepted > 0:
+					n := resp.Accepted
+					if n > len(results) {
+						n = len(results)
+					}
+					if err := sp.AckPrefix(n); err != nil {
+						slog.Warn("probe: acknowledgement not recorded locally; batch will retry",
+							"error", err, "accepted", n)
+					}
+				}
+				progressed = sp.Pending() < pendingBefore
+			} else {
+				// Advance only over what hz acknowledged.
+				if resp.Accepted > 0 && resp.Accepted <= len(results) {
+					sent = results[resp.Accepted-1].At
+					progressed = true
+				}
 			}
+
 			if resp.Interval > 0 {
 				next = time.Duration(resp.Interval) * time.Second
 			}
 			// A backlog is drained promptly rather than one batch per
 			// interval, which would take hours to catch up after an outage.
-			if more && resp.Accepted > 0 {
+			if more && progressed {
 				next = time.Second
 			}
 

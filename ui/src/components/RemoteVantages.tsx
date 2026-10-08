@@ -239,6 +239,49 @@ function VantageRow({
               />
             </Tooltip>
           )}
+          {/* The durable backlog is the agent's side of the delivery
+              guarantee. A non-zero depth means an outage is still draining;
+              dropped results mean the backlog cap discarded the oldest
+              observations; degraded/corrupt mean the agent cannot currently
+              trust its state file. Pull vantages never send these. */}
+          {(probe.spoolPending ?? 0) > 0 && (
+            <Tooltip
+              title={`${probe.spoolPending} result${probe.spoolPending === 1 ? "" : "s"} produced but not yet acknowledged by hz${
+                probe.spoolOldestAt ? `; oldest from ${relativeTime(probe.spoolOldestAt)}` : ""
+              }. They are stored on the agent and retried; this is a backlog draining, not lost data.`}
+            >
+              <Chip
+                size="small"
+                variant="outlined"
+                label={`backlog ${probe.spoolPending}${probe.spoolOldestAt ? ` · oldest ${relativeTime(probe.spoolOldestAt)}` : ""}`}
+                sx={{ height: 20, fontSize: "0.7rem" }}
+              />
+            </Tooltip>
+          )}
+          {(probe.spoolDropped ?? 0) > 0 && (
+            <Tooltip
+              title={`${probe.spoolDropped} unacknowledged result${probe.spoolDropped === 1 ? " was" : "s were"} discarded because the backlog passed its capacity (${
+                probe.spoolCap || 5000
+              }). The oldest observations are dropped first so current ones survive; the agent keeps probing.`}
+            >
+              <Chip
+                size="small"
+                color="warning"
+                label={`lost ${probe.spoolDropped}`}
+                sx={{ height: 20, fontSize: "0.7rem" }}
+              />
+            </Tooltip>
+          )}
+          {probe.spoolState === "degraded" && (
+            <Tooltip title="The agent cannot write its state file right now. Results still report from memory, but a restart would lose its backlog until the disk recovers — check the agent host's /var/lib/hz-probe.">
+              <Chip size="small" color="error" label="backlog not persisted" sx={{ height: 20, fontSize: "0.7rem" }} />
+            </Tooltip>
+          )}
+          {probe.spoolState === "corrupt" && (
+            <Tooltip title="The agent's state file was unreadable and was quarantined; its backlog started empty. It heals on the next successful write — check the agent's logs for what was lost.">
+              <Chip size="small" color="error" label="state file reset" sx={{ height: 20, fontSize: "0.7rem" }} />
+            </Tooltip>
+          )}
         </Box>
 
         {probe.url && (

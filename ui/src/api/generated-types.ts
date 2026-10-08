@@ -555,6 +555,16 @@ export interface RemoteProbeResp {
   targetsVersion?: string;
   targetCount: number /* int */;
   checkCount: number /* int */; // check rows this vantage contributes
+  /**
+   * The agent's durable send backlog, as of its latest report. Zero/empty
+   * on a healthy or older agent; non-zero signals an outage still draining,
+   * retention drops, or a state file the agent cannot write.
+   */
+  spoolPending?: number /* int */;
+  spoolCap?: number /* int */;
+  spoolDropped?: number /* int64 */;
+  spoolOldestAt?: any /* time.Time */;
+  spoolState?: string; // "", "ok", "degraded", "corrupt"
 }
 /**
  * RemoteProbeRequest adds or edits a vantage.

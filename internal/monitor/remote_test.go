@@ -2,8 +2,11 @@ package monitor
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -358,9 +361,11 @@ func TestPushWatchdogMarksSilentVantages(t *testing.T) {
 	}
 
 	// One report, then silence past three intervals.
-	m.AcceptPushedResults(rp, "quiet", "v-test", []probe.Result{
+	if _, err := m.ReceivePush(rp, "quiet", "v-test", []probe.Result{
 		{Target: "h", Host: "h", Kind: probe.KindDNS, At: time.Now().UTC(), Status: StatusOK},
-	})
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 	if got := m.GetStatus("ext:quiet:agent"); got == nil || got.Status != StatusOK {
 		t.Fatalf("agent row after a report = %+v, want ok", got)
 	}
@@ -379,8 +384,8 @@ func TestPushWatchdogMarksSilentVantages(t *testing.T) {
 	}
 }
 
-// The accepted count is the agent's watermark: over-count loses results,
-// under-count duplicates them.
+// The receipt names every result hz now holds: over-ack loses results on the
+// agent, missing an identity duplicates them.
 func TestAcceptedCountMatchesWhatWasFolded(t *testing.T) {
 	cfg := probeCfg()
 	m := New(cfg)
@@ -394,8 +399,12 @@ func TestAcceptedCountMatchesWhatWasFolded(t *testing.T) {
 		{Target: host, Host: host, Kind: probe.KindDNS, At: base, Status: StatusOK},
 		{Target: host, Host: host, Kind: probe.KindHTTPS, At: base.Add(time.Second), Status: StatusFailed, Error: "boom"},
 	}
-	if n := m.AcceptPushedResults(rp, "v", "v-test", results); n != len(results) {
-		t.Fatalf("accepted %d of %d", n, len(results))
+	receipt, err := m.ReceivePush(rp, "v", "v-test", results, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Fresh != len(results) || len(receipt.AckIDs) != len(results) {
+		t.Fatalf("receipt = %+v, want %d fresh and acked", receipt, len(results))
 	}
 	if m.GetStatus("ext:v:dns:"+host) == nil || m.GetStatus("ext:v:https:"+host) == nil {
 		t.Fatal("both results should have become check rows")
@@ -440,11 +449,13 @@ func TestRowsArePrunedWhenTargetsGoAway(t *testing.T) {
 
 	now := time.Now().UTC()
 	// Two hosts: one hz still serves, one it does not.
-	m.AcceptPushedResults(rp, "v", "x", []probe.Result{
+	if _, err := m.ReceivePush(rp, "v", "x", []probe.Result{
 		{Target: "api.example.com", Host: "api.example.com", Kind: probe.KindDNS, At: now, Status: StatusOK},
 		{Target: "gone.example.com", Host: "gone.example.com", Kind: probe.KindDNS, At: now, Status: StatusFailed, Error: "nope"},
 		{Target: "gone.example.com", Host: "gone.example.com", Kind: probe.KindHTTPS, At: now, Status: StatusFailed, Error: "nope"},
-	})
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	// probeCfg serves api.example.com and docs.example.com, never gone.
 	if m.GetStatus("ext:v:dns:api.example.com") == nil {
@@ -577,10 +588,12 @@ func TestPruneDropsAKindWithoutDroppingTheHost(t *testing.T) {
 	rp := config.RemoteProbe{Name: "v", Mode: config.ProbeModePush, Token: "t", Enabled: true}
 
 	now := time.Now().UTC()
-	m.AcceptPushedResults(rp, "v", "x", []probe.Result{
+	if _, err := m.ReceivePush(rp, "v", "x", []probe.Result{
 		{Target: "parked.example.com", Host: "parked.example.com", Kind: probe.KindDNS, At: now, Status: StatusOK},
 		{Target: "parked.example.com", Host: "parked.example.com", Kind: probe.KindHTTPS, At: now, Status: StatusFailed, Error: "503"},
-	})
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 	if m.GetStatus("ext:v:https:parked.example.com") == nil {
 		t.Fatal("setup: the https row should exist while the service is live")
 	}
@@ -593,14 +606,174 @@ func TestPruneDropsAKindWithoutDroppingTheHost(t *testing.T) {
 	}}
 	m.config.Store(&next)
 
-	m.AcceptPushedResults(rp, "v", "x", []probe.Result{
+	if _, err := m.ReceivePush(rp, "v", "x", []probe.Result{
 		{Target: "parked.example.com", Host: "parked.example.com", Kind: probe.KindDNS, At: now, Status: StatusOK},
-	})
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	if m.GetStatus("ext:v:https:parked.example.com") != nil {
 		t.Fatal("the https row survived and would sit red forever")
 	}
 	if m.GetStatus("ext:v:dns:parked.example.com") == nil {
 		t.Fatal("the dns row was pruned; that is the reservation")
+	}
+}
+
+// A retried delivery — the answer to the first report was lost — must not
+// touch check rows, history or alerts a second time, but it is still a fresh
+// liveness proof: reachability advances and the agent row heartbeats.
+func TestReceivePushRetriedReportFoldsOnceHeartbeatsTwice(t *testing.T) {
+	var alerts int64
+	ntfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&alerts, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ntfy.Close()
+
+	cfg := probeCfg()
+	cfg.NtfyURL = ntfy.URL
+	m := New(cfg)
+	defer m.Stop()
+	rp := config.RemoteProbe{Name: "v", Mode: config.ProbeModePush, Token: "t", Enabled: true}
+
+	const host = "api.example.com"
+	now := time.Now().UTC()
+	batch := []probe.Result{{
+		ID: "id-1", Target: host, Host: host, Kind: probe.KindHTTPS,
+		At: now, Status: StatusFailed, Error: "boom",
+	}}
+
+	r1, err := m.ReceivePush(rp, "v", "v1", batch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Fresh != 1 || len(r1.AckIDs) != 1 || r1.AckIDs[0] != "id-1" {
+		t.Fatalf("first receipt = %+v", r1)
+	}
+	firstPoll := m.remoteStateForTest("v").LastPoll
+	time.Sleep(5 * time.Millisecond)
+
+	// Same bytes, same identity — the response was lost and the agent retries.
+	r2, err := m.ReceivePush(rp, "v", "v1", batch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.Fresh != 0 {
+		t.Fatalf("the retried batch must fold zero fresh results, got %d", r2.Fresh)
+	}
+	if len(r2.AckIDs) != 1 || r2.AckIDs[0] != "id-1" {
+		t.Fatalf("the retry must still be acknowledged so the agent can clear it: %+v", r2)
+	}
+
+	if got := len(m.GetHistory("ext:v:https:" + host)); got != 1 {
+		t.Fatalf("the result history must hold exactly one point, got %d", got)
+	}
+	if got := atomic.LoadInt64(&alerts); got != 1 {
+		t.Fatalf("a transition alert must fire once, got %d", got)
+	}
+	if got := len(m.GetHistory("ext:v:agent")); got != 2 {
+		t.Fatalf("each delivery heartbeats the agent row, got %d points", got)
+	}
+	if st := m.remoteStateForTest("v"); !st.LastPoll.After(firstPoll) || !st.Reachable {
+		t.Fatalf("duplicate delivery must still advance reachability: %+v", st)
+	}
+}
+
+// remoteStateForTest reads one live vantage state without needing the probe
+// to exist in config (RemoteStates only lists configured entries).
+func (m *Monitor) remoteStateForTest(name string) RemoteState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return *m.remoteStates[name]
+}
+
+// An older agent sends no IDs. The content hash keeps its retries honest.
+func TestReceivePushLegacyAgentDedupesByContent(t *testing.T) {
+	m := New(probeCfg())
+	defer m.Stop()
+	rp := config.RemoteProbe{Name: "v", Mode: config.ProbeModePush, Token: "t", Enabled: true}
+	const host = "api.example.com"
+	batch := []probe.Result{{
+		Target: host, Host: host, Kind: probe.KindDNS,
+		At: time.Now().UTC(), Status: StatusOK,
+	}}
+
+	r1, err := m.ReceivePush(rp, "v", "old", batch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := m.ReceivePush(rp, "v", "old", batch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Fresh != 1 || r2.Fresh != 0 || len(r2.AckIDs) != 1 ||
+		!strings.HasPrefix(r2.AckIDs[0], "c:") {
+		t.Fatalf("legacy dedup receipts wrong: %+v / %+v", r1, r2)
+	}
+	if got := len(m.GetHistory("ext:v:dns:" + host)); got != 1 {
+		t.Fatalf("legacy retry duplicated a history point: %d", got)
+	}
+}
+
+// The de-dup memory survives an hz restart: a new process over the same
+// journal directory refuses to re-fold a report the old process held.
+func TestReceivePushDedupSurvivesGatewayRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "push")
+	cfg := probeCfg()
+	const host = "api.example.com"
+	batch := []probe.Result{{
+		ID: "persisted-id", Target: host, Host: host, Kind: probe.KindDNS,
+		At: time.Now().UTC(), Status: StatusOK,
+	}}
+	rp := config.RemoteProbe{Name: "v", Mode: config.ProbeModePush, Token: "t", Enabled: true}
+
+	m1 := New(cfg, WithPushJournalRoot(dir))
+	if _, err := m1.ReceivePush(rp, "v", "v1", batch, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// New process: in-memory check state is empty, the journal is not.
+	m2 := New(probeCfg(), WithPushJournalRoot(dir))
+	r, err := m2.ReceivePush(rp, "v", "v1", batch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Fresh != 0 {
+		t.Fatalf("a report held before the restart must not fold again, fresh=%d", r.Fresh)
+	}
+	if got := len(m2.GetHistory("ext:v:dns:" + host)); got != 0 {
+		t.Fatalf("no fold means no history on the new process, got %d points", got)
+	}
+	if m2.GetStatus("ext:v:dns:"+host) != nil {
+		t.Fatal("no fold means no status row on the new process")
+	}
+}
+
+// The agent's backlog signals become per-vantage state for the API/UI.
+func TestReceivePushRecordsSpoolStats(t *testing.T) {
+	m := New(probeCfg())
+	defer m.Stop()
+	rp := config.RemoteProbe{Name: "v", Mode: config.ProbeModePush, Token: "t", Enabled: true}
+	oldest := time.Now().UTC().Add(-time.Hour)
+	_, err := m.ReceivePush(rp, "v", "v1", nil, &probe.SpoolStats{
+		Pending: 12, Cap: 5000, DroppedTotal: 3, OldestAt: &oldest, State: probe.SpoolStateDegraded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := m.remoteStateForTest("v")
+	if st.SpoolPending != 12 || st.SpoolCap != 5000 || st.SpoolDropped != 3 ||
+		!st.SpoolOldestAt.Equal(oldest) || st.SpoolState != probe.SpoolStateDegraded {
+		t.Fatalf("spool stats not recorded: %+v", st)
+	}
+
+	// An older agent sends no block; the fields clear rather than lie stale.
+	if _, err := m.ReceivePush(rp, "v", "old", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	st = m.remoteStateForTest("v")
+	if st.SpoolPending != 0 || st.SpoolState != "" || st.SpoolDropped != 0 {
+		t.Fatalf("absent spool block must clear the fields, got %+v", st)
 	}
 }

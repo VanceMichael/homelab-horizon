@@ -2,7 +2,9 @@ package probe
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +14,22 @@ import (
 	"strings"
 	"time"
 )
+
+// newResultID mints a result's stable identity: 128 random bits, hex. Random
+// rather than a counter so the identity needs no persisted sequence and is
+// unique the moment it exists — two agents, or one restarted mid-flight, can
+// never collide.
+func newResultID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand fails only when the kernel has no entropy source, in
+		// which case the TLS these probes run over cannot work either. Panic
+		// rather than hand out an empty ID that hz would treat as "legacy":
+		// a silent identity collision is worse than a loud start failure.
+		panic("probe: cannot generate result id: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // certWarningDays is how close to expiry a certificate starts warning. The
 // same seven days the local TLS check uses: Let's Encrypt renews at 30 days
@@ -56,6 +74,7 @@ func Run(ctx context.Context, ts TargetSet, t Target) []Result {
 // result builds a Result, deriving the status from the error when one is set.
 func result(t Target, kind string, latency time.Duration, status, detail string, err error) Result {
 	r := Result{
+		ID:        newResultID(),
 		Target:    t.Name,
 		Host:      t.Host,
 		Kind:      kind,
