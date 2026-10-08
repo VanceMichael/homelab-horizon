@@ -1239,6 +1239,12 @@ func LoadAuto() (*Config, string, error) {
 	return cfg, path, nil
 }
 
+// Save writes the config atomically: a temp file in the same directory is
+// fully written, fsynced, and then renamed over the target. Readers (including
+// a restarting process) therefore see either the complete previous file or
+// the complete new file — never a half-written one, which matters at the
+// peer-sync commit point where a torn write would leave a gateway without a
+// reproducible config.
 func Save(path string, cfg *Config) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
@@ -1251,7 +1257,33 @@ func Save(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp config file: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Harmless once the rename succeeded; cleans up on every error path.
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing temp config: %w", err)
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp config: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("renaming config into place: %w", err)
+	}
+	return nil
 }
 
 // GetInterfaceIP returns the first IPv4 address of the specified network interface

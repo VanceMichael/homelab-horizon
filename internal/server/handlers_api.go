@@ -134,13 +134,20 @@ func (s *Server) handleAPIDashboard(w http.ResponseWriter, r *http.Request) {
 	if cfg := s.cfg(); cfg.PeerID != "" && !cfg.ConfigPrimary {
 		if primary := cfg.PrimaryPeer(); primary != nil {
 			snap := s.peerSyncSnapshot()
+			state := string(snap.State)
+			if state == "" {
+				state = apitypes.PullStateSynced
+			}
 			resp.PeerSync = &apitypes.PeerSyncStatus{
-				PrimaryID:     primary.ID,
-				PullCount:     snap.PullCount,
-				LastPullAt:    unixOrZero(snap.LastPullAt),
-				LastSuccessAt: unixOrZero(snap.LastSuccessAt),
-				LastApplyAt:   unixOrZero(snap.LastApplyAt),
-				LastError:     snap.LastError,
+				PrimaryID:      primary.ID,
+				State:          state,
+				PullCount:      snap.PullCount,
+				LastPullAt:     unixOrZero(snap.LastPullAt),
+				LastSuccessAt:  unixOrZero(snap.LastSuccessAt),
+				LastApplyAt:    unixOrZero(snap.LastApplyAt),
+				LastError:      snap.LastError,
+				ConflictCount:  snap.ConflictCount,
+				LastConflictAt: unixOrZero(snap.LastConflictAt),
 			}
 		}
 	}

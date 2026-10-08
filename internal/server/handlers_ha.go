@@ -79,6 +79,23 @@ func (s *Server) handleAPIHAStatus(w http.ResponseWriter, r *http.Request) {
 		Peers:         make([]apitypes.HAFleetPeer, 0, len(cfg.Peers)),
 	}
 
+	// Attach this instance's pull state to exactly one row: the self row if
+	// the fleet lists this host, otherwise the primary-marked row.
+	syncStateTarget := ""
+	if !cfg.ConfigPrimary {
+		for _, p := range cfg.Peers {
+			if p.ID == cfg.PeerID {
+				syncStateTarget = p.ID
+				break
+			}
+		}
+		if syncStateTarget == "" {
+			if pp := cfg.PrimaryPeer(); pp != nil {
+				syncStateTarget = pp.ID
+			}
+		}
+	}
+
 	for _, p := range cfg.Peers {
 		fp := apitypes.HAFleetPeer{
 			ID:      p.ID,
@@ -124,13 +141,19 @@ func (s *Server) handleAPIHAStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Sync status (only relevant if we're non-primary)
-		if !cfg.ConfigPrimary {
+		// Pull-loop state belongs to THIS instance, not to the row's peer.
+		// Attach it to the self row when the fleet config lists this host;
+		// spare fleets conventionally list only the primary, so fall back to
+		// the primary-marked row (the row the spare actually pulls from).
+		if syncStateTarget != "" && p.ID == syncStateTarget {
 			snap := s.peerSyncSnapshot()
 			if !snap.LastSuccessAt.IsZero() {
 				fp.LastSyncAt = snap.LastSuccessAt.Format(time.RFC3339)
 			}
 			fp.LastSyncErr = snap.LastError
+			if snap.State != "" {
+				fp.SyncState = string(snap.State)
+			}
 		}
 
 		resp.Peers = append(resp.Peers, fp)

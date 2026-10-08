@@ -204,7 +204,9 @@ func (s *Server) handleAPIAddService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	writeJSONOK(w)
 }
 
@@ -353,7 +355,9 @@ func (s *Server) handleAPIEditService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	writeJSONOK(w)
 }
 
@@ -388,7 +392,9 @@ func (s *Server) handleAPIDeleteService(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	writeJSONOK(w)
 }
 
@@ -814,7 +820,9 @@ func (s *Server) handleAPIDomainSSLAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(apitypes.DomainSSLAddResponse{
 		OK:      true,
@@ -971,7 +979,9 @@ func (s *Server) handleAPIDomainSSLRemove(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	writeJSONOK(w)
 }
 

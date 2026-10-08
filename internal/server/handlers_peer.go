@@ -8,6 +8,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -28,15 +29,21 @@ import (
 type PeerPingResponse struct {
 	PeerID          string            `json:"peer_id"`
 	ConfigPrimary   bool              `json:"config_primary"`
+	SharedRev       string            `json:"shared_rev,omitempty"`
 	IPTablesSummary *iptables.Summary `json:"iptables_summary,omitempty"`
 }
 
 // handlePeerPing returns this instance's identity. Cheap, used for liveness
 // at decision time (cert ownership, config sync) instead of a heartbeat.
+// SharedRev lets a pulling peer decide whether a config fetch is needed
+// (preflight) and re-validate, at the commit point, that the fetched body is
+// still the primary's current shared revision.
 func (s *Server) handlePeerPing(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg()
 	resp := PeerPingResponse{
-		PeerID:        s.cfg().PeerID,
-		ConfigPrimary: s.cfg().ConfigPrimary,
+		PeerID:        cfg.PeerID,
+		ConfigPrimary: cfg.ConfigPrimary,
+		SharedRev:     sharedConfigDigest(cfg),
 	}
 	// Best-effort iptables classification — failures here don't fail the
 	// ping (we still need to report peer identity for cert ownership etc.)
@@ -51,8 +58,22 @@ func (s *Server) handlePeerPing(w http.ResponseWriter, r *http.Request) {
 // handlePeerConfig returns the full config JSON. Only the config primary
 // serves a meaningful response; non-primaries can serve too (it's read-only)
 // but pulls should target the primary.
+//
+// Conditional transport: every response carries ETag: "<shared-rev>", the
+// content digest of the fleet-shared fields. If-None-Match with that digest
+// yields 304 and no body, so unchanged pull rounds cost no parse/save work.
+// A pulling peer that does not send the header (older build) gets the full
+// 200 exactly as before — mixed-version fleets keep converging.
 func (s *Server) handlePeerConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg()
+	rev := sharedConfigDigest(cfg)
+	etag := `"` + rev + `"`
+	w.Header().Set("ETag", etag)
+
+	if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match != "" && (match == etag || match == rev) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -263,11 +284,16 @@ func (s *Server) snapshotWGPeers() []config.WGPeer {
 }
 
 // applyWGPeersFromConfig applies the WGPeers list from config to the local
-// WG config file. Called by applyNewConfig on non-primary instances when the
-// pulled config has a different peer set.
-func (s *Server) applyWGPeersFromConfig(cfg *config.Config) {
-	if s.wg == nil || len(cfg.WGPeers) == 0 {
-		return
+// WG config file. Called when a pulled config has a different peer set.
+//
+// The diff is idempotent: every failing peer op is collected (not fatal) and
+// the function still walks the whole desired set, so a retry after a partial
+// failure converges instead of wedging on the first error. The joined error
+// is what lets the pull loop report a half-applied WG state as a recovery
+// failure rather than as success.
+func (s *Server) applyWGPeersFromConfig(cfg *config.Config) error {
+	if s.wg == nil {
+		return nil
 	}
 
 	current := s.wg.GetPeers()
@@ -281,14 +307,16 @@ func (s *Server) applyWGPeersFromConfig(cfg *config.Config) {
 		desiredByKey[p.PublicKey] = p
 	}
 
+	var errs []error
 	changed := false
 
 	// Remove peers not in desired set.
 	for _, p := range current {
 		if _, ok := desiredByKey[p.PublicKey]; !ok {
-			slog.Info("peer-sync: removing WG peer", "name", p.Name, "pubkey_prefix", p.PublicKey[:8])
+			slog.Info("peer-sync: removing WG peer", "name", p.Name, "pubkey_prefix", safeKeyPrefix(p.PublicKey))
 			if err := s.wg.RemovePeer(p.PublicKey); err != nil {
 				slog.Error("peer-sync: remove WG peer failed", "name", p.Name, "err", err)
+				errs = append(errs, fmt.Errorf("remove %s: %w", p.Name, err))
 			}
 			changed = true
 		}
@@ -297,9 +325,10 @@ func (s *Server) applyWGPeersFromConfig(cfg *config.Config) {
 	// Add or update peers.
 	for _, desired := range cfg.WGPeers {
 		if _, exists := currentByKey[desired.PublicKey]; !exists {
-			slog.Info("peer-sync: adding WG peer", "name", desired.Name, "pubkey_prefix", desired.PublicKey[:8])
+			slog.Info("peer-sync: adding WG peer", "name", desired.Name, "pubkey_prefix", safeKeyPrefix(desired.PublicKey))
 			if err := s.wg.AddPeer(desired.Name, desired.PublicKey, desired.AllowedIPs); err != nil {
 				slog.Error("peer-sync: add WG peer failed", "name", desired.Name, "err", err)
+				errs = append(errs, fmt.Errorf("add %s: %w", desired.Name, err))
 			}
 			changed = true
 		} else {
@@ -310,6 +339,7 @@ func (s *Server) applyWGPeersFromConfig(cfg *config.Config) {
 						slog.Info("peer-sync: updating WG peer", "name", desired.Name)
 						if err := s.wg.UpdatePeer(desired.PublicKey, desired.Name, desired.AllowedIPs); err != nil {
 							slog.Error("peer-sync: update WG peer failed", "name", desired.Name, "err", err)
+							errs = append(errs, fmt.Errorf("update %s: %w", desired.Name, err))
 						}
 						changed = true
 					}
@@ -322,50 +352,70 @@ func (s *Server) applyWGPeersFromConfig(cfg *config.Config) {
 	if changed {
 		if err := s.wg.Reload(); err != nil {
 			slog.Error("peer-sync: WG reload after peer sync failed", "err", err)
+			errs = append(errs, fmt.Errorf("wg reload: %w", err))
 		}
 		s.rebuildWGChains()
 	}
+	return errors.Join(errs...)
 }
 
-// applyNewConfig swaps the live config and reloads derived subsystems.
-// Used by the pull loop on non-primary instances.
-//
-// Fields that affect bind address, WG interface name, or token storage are
-// not hot-swappable; if those change, log a warning and the operator must
-// restart the instance.
-func (s *Server) applyNewConfig(newCfg *config.Config) error {
-	old := s.cfg()
-	// Preserve runtime-only fields that should never come from the primary.
-	newCfg.AdminToken = old.AdminToken
-	// The --listen override belongs to this process, not to the fleet: a
-	// config pulled from the primary must not silently move where this
-	// instance is bound.
-	newCfg.SetListenOverride(old.ListenOverride())
-	s.config.Store(newCfg)
+// safeKeyPrefix returns the first 8 chars of a public key for logs, or a
+// placeholder when the key is unexpectedly short.
+func safeKeyPrefix(k string) string {
+	if len(k) < 8 {
+		return "?"
+	}
+	return k[:8]
+}
 
-	if err := config.Save(s.configPath, newCfg); err != nil {
-		return fmt.Errorf("save: %w", err)
+// postPullRecoveryHook, when non-nil, runs as an additional step at the end
+// of recoverDerivedState. Test-only seam for the recovery-failure/replay
+// paths; always nil in production.
+var postPullRecoveryHook func(cfg *config.Config) error
+
+// recoverDerivedState re-derives every subsystem that follows the config,
+// after the config has been durably committed. It must be idempotent and
+// safe to RE-RUN (the pull loop replays it on later rounds when a previous
+// recovery failed), and narrow: local checks converge via RefreshChecks
+// (inside syncServices) and outside-in vantages via ReloadRemotes, which
+// restarts only the probes that actually changed — never the blunt
+// monitor.Reload that stops every check and wipes all history.
+func (s *Server) recoverDerivedState(old, newCfg *config.Config) error {
+	var errs []error
+
+	if err := s.syncServices(); err != nil {
+		errs = append(errs, err)
 	}
 
-	// Re-derive subsystem state (dnsmasq mappings, haproxy backends, LE).
-	s.syncServices()
+	if err := s.applyWGPeersFromConfig(newCfg); err != nil {
+		errs = append(errs, err)
+	}
 
-	// Apply WG peer list from the pulled config to local WG config file.
-	s.applyWGPeersFromConfig(newCfg)
+	// Vantages are local-only state carried through the merge unchanged, so
+	// unchanged probes keep their loops; only add/remove/changed ones touch
+	// the scheduler.
+	if s.monitor != nil {
+		s.monitor.ReloadRemotes(newCfg)
+	}
 
-	// Monitor watches ServiceChecks + auto-generated checks from Services.
-	// Reload picks up both. Cheap when nothing actually changed but we only
-	// reach here on a real config delta, so accept the unconditional restart.
-	s.monitor.Reload(newCfg)
-
-	if old.ListenAddr != newCfg.ListenAddr ||
+	if old != nil && (old.ListenAddr != newCfg.ListenAddr ||
 		old.WGInterface != newCfg.WGInterface ||
-		old.WGConfigPath != newCfg.WGConfigPath {
+		old.WGConfigPath != newCfg.WGConfigPath) {
 		slog.Warn("peer-sync: low-level config changed (listen/wg) — restart required to take effect")
 	}
 
+	if postPullRecoveryHook != nil {
+		if err := postPullRecoveryHook(newCfg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	// A pulled peer config is, by definition, the synced state for this
-	// instance — track it so a non-primary never shows phantom pending changes.
+	// instance — track it so a non-primary never shows phantom pending
+	// changes, even when a derived step still needs a later replay.
 	s.markSynced()
-	return nil
+
+	return errors.Join(errs...)
 }
+
+

@@ -256,7 +256,9 @@ func (m *MCPServer) handleUpdateService(_ context.Context, req mcp.CallToolReque
 		if err := config.Save(m.srv.configPath, m.srv.cfg()); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("save failed: %s", err)), nil
 		}
-		m.srv.syncServices()
+		if err := m.srv.syncServices(); err != nil {
+			slog.Warn("derived services reload reported errors", "err", err)
+		}
 		return mcp.NewToolResultText(fmt.Sprintf("Service %q deleted", name)), nil
 
 	case "add":
@@ -271,7 +273,9 @@ func (m *MCPServer) handleUpdateService(_ context.Context, req mcp.CallToolReque
 		if err := config.Save(m.srv.configPath, m.srv.cfg()); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("save failed: %s", err)), nil
 		}
-		m.srv.syncServices()
+		if err := m.srv.syncServices(); err != nil {
+			slog.Warn("derived services reload reported errors", "err", err)
+		}
 		return mcp.NewToolResultText(fmt.Sprintf("Service %q added", name)), nil
 
 	case "edit":
@@ -317,7 +321,9 @@ func (m *MCPServer) handleUpdateService(_ context.Context, req mcp.CallToolReque
 		if err := config.Save(m.srv.configPath, m.srv.cfg()); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("save failed: %s", err)), nil
 		}
-		m.srv.syncServices()
+		if err := m.srv.syncServices(); err != nil {
+			slog.Warn("derived services reload reported errors", "err", err)
+		}
 		return mcp.NewToolResultText(fmt.Sprintf("Service %q updated", name)), nil
 
 	default:

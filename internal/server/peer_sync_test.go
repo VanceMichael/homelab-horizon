@@ -2,12 +2,15 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,17 +159,27 @@ func newTestServer(t *testing.T, cfg *config.Config) *Server {
 		t.Fatalf("save initial config: %v", err)
 	}
 
+	// Reload through config.Load, exactly as production New() does: the
+	// Default() overlay that Load applies is part of the on-the-wire shape
+	// (a peer parses served JSON over defaults). Without this round-trip a
+	// literal-struct test primary and a JSON-parsed standby would disagree
+	// on the shared digest even in production-identical states.
+	live, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("reload initial config: %v", err)
+	}
+
 	s := &Server{
 		configPath:    cfgPath,
 		adminToken:    "test-admin",
 		csrfSecret:    "test-csrf",
-		monitor:       monitor.New(cfg),
+		monitor:       monitor.New(live),
 		sync:          NewSyncBroadcaster(),
 		health:        &HealthStatus{healthy: true},
 		configShares:  make(map[string]*configShare),
 		installGrants: newInstallGrants(),
 	}
-	s.config.Store(cfg)
+	s.config.Store(live)
 	return s
 }
 
@@ -1190,6 +1203,573 @@ func TestBuildPeerURL(t *testing.T) {
 		got := buildPeerURL(tt.addr, tt.path)
 		if got != tt.want {
 			t.Errorf("buildPeerURL(%q, %q) = %q, want %q", tt.addr, tt.path, got, tt.want)
+		}
+	}
+}
+
+// TestUpdateConfigSerializesConcurrentWrites guards the lost-update property
+// configMu provides: two writers hammering DIFFERENT fields must both have
+// their final value in memory and on disk.
+func TestUpdateConfigSerializesConcurrentWrites(t *testing.T) {
+	s := newTestServer(t, &config.Config{
+		PeerID:        "site-b",
+		ConfigPrimary: false,
+		Peers:         []config.Peer{{ID: "site-a", WGAddr: "10.0.0.1:8080", Primary: true}},
+		VPNRange:      "10.100.0.0/24",
+	})
+
+	const n = 200
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < n; i++ {
+			_ = s.updateConfig(func(c *config.Config) { c.PublicIP = fmt.Sprintf("203.0.113.%d", i%250+1) })
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < n; i++ {
+			_ = s.updateConfig(func(c *config.Config) { c.LastLocalIface = fmt.Sprintf("eth%d", i) })
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	// Deterministic final values from each writer, set after the hammer.
+	if err := s.updateConfig(func(c *config.Config) { c.PublicIP = "203.0.113.254" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.updateConfig(func(c *config.Config) { c.LastLocalIface = "eth-final" }); err != nil {
+		t.Fatal(err)
+	}
+
+	live := s.cfg()
+	if live.PublicIP != "203.0.113.254" || live.LastLocalIface != "eth-final" {
+		t.Errorf("lost update in memory: ip=%q iface=%q", live.PublicIP, live.LastLocalIface)
+	}
+	onDisk, err := config.Load(s.configPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if onDisk.PublicIP != live.PublicIP || onDisk.LastLocalIface != live.LastLocalIface {
+		t.Errorf("disk/memory divergence: disk ip=%q iface=%q", onDisk.PublicIP, onDisk.LastLocalIface)
+	}
+}
+
+// TestCommitPulledConfig exercises every commit gate plus the success path.
+func TestCommitPulledConfig(t *testing.T) {
+	primaryRemote := &config.Config{
+		PeerID:        "site-a",
+		ConfigPrimary: true,
+		Services:      []config.Service{{Name: "svc-from-primary"}},
+		Zones:         []config.Zone{{Name: "example.com"}},
+		VPNRange:      "10.100.0.0/24",
+	}
+	remoteRev := sharedConfigDigest(primaryRemote)
+
+	newStandby := func(t *testing.T) *Server {
+		return newTestServer(t, &config.Config{
+			PeerID:        "site-b",
+			ConfigPrimary: false,
+			Peers:         []config.Peer{{ID: "site-a", WGAddr: "10.0.0.1:8080", Primary: true}},
+			Services:      []config.Service{{Name: "stale"}},
+			VPNRange:      "10.100.0.0/24",
+		})
+	}
+	baseFrom := func(s *Server) pullAttemptBase {
+		return pullAttemptBase{
+			peerID:      "site-b",
+			primaryID:   "site-a",
+			primaryAddr: "10.0.0.1:8080",
+			baseRev:     sharedConfigDigest(s.cfg()),
+		}
+	}
+	baseFromCfg := func(c *config.Config) pullAttemptBase {
+		return pullAttemptBase{
+			peerID:      "site-b",
+			primaryID:   "site-a",
+			primaryAddr: "10.0.0.1:8080",
+			baseRev:     sharedConfigDigest(c),
+		}
+	}
+
+	t.Run("commits merged config and persists", func(t *testing.T) {
+		s := newStandby(t)
+		out, _, changed, err := s.commitPulledConfig(primaryRemote, remoteRev, baseFrom(s), remoteRev)
+		if err != nil || !changed {
+			t.Fatalf("commit: changed=%v err=%v", changed, err)
+		}
+		if len(out.Services) != 1 || out.Services[0].Name != "svc-from-primary" {
+			t.Errorf("shared fields not applied: %+v", out.Services)
+		}
+		if out.PeerID != "site-b" || out.ConfigPrimary {
+			t.Errorf("local identity clobbered: peer=%q primary=%v", out.PeerID, out.ConfigPrimary)
+		}
+		persisted, err := config.Load(s.configPath)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if len(persisted.Services) != 1 || persisted.Services[0].Name != "svc-from-primary" {
+			t.Errorf("disk not converged: %+v", persisted.Services)
+		}
+	})
+
+	t.Run("no change reports unchanged", func(t *testing.T) {
+		s := newStandby(t)
+		// Remote whose shared portion matches the standby's current one.
+		same := *s.cfg()
+		same.PeerID = "site-a"
+		same.ConfigPrimary = true
+		same.Peers = []config.Peer{{ID: "site-b", WGAddr: "10.0.0.2:8080"}}
+		rev := sharedConfigDigest(&same)
+		_, _, changed, err := s.commitPulledConfig(&same, rev, baseFrom(s), rev)
+		if err != nil {
+			t.Fatalf("identical shared base: %v", err)
+		}
+		if changed {
+			t.Error("identical shared base must report changed=false")
+		}
+	})
+
+	t.Run("role change rejects without write", func(t *testing.T) {
+		s := newStandby(t)
+		ptrBefore := s.cfg()
+		if err := s.updateConfig(func(c *config.Config) { c.ConfigPrimary = true }); err != nil {
+			t.Fatal(err)
+		}
+		_, _, changed, err := s.commitPulledConfig(primaryRemote, remoteRev, baseFromCfg(ptrBefore), remoteRev)
+		if !errors.Is(err, errPullRoleChanged) || changed {
+			t.Fatalf("want errPullRoleChanged/changed=false, got %v/%v", err, changed)
+		}
+		if s.cfg().ConfigPrimary != true {
+			t.Error("live config mutated by rejected commit")
+		}
+	})
+
+	t.Run("topology change rejects", func(t *testing.T) {
+		s := newStandby(t)
+		before := baseFrom(s)
+		if err := s.updateConfig(func(c *config.Config) {
+			c.Peers[0].WGAddr = "10.0.0.99:8080"
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, err := s.commitPulledConfig(primaryRemote, remoteRev, before, remoteRev)
+		if !errors.Is(err, errPullTopologyMoved) {
+			t.Fatalf("want errPullTopologyMoved, got %v", err)
+		}
+	})
+
+	t.Run("no primary rejects", func(t *testing.T) {
+		s := newStandby(t)
+		before := baseFrom(s)
+		if err := s.updateConfig(func(c *config.Config) {
+			c.Peers[0].Primary = false
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, err := s.commitPulledConfig(primaryRemote, remoteRev, before, remoteRev)
+		if !errors.Is(err, errPullNoPrimary) {
+			t.Fatalf("want errPullNoPrimary, got %v", err)
+		}
+	})
+
+	t.Run("local shared base change rejects", func(t *testing.T) {
+		s := newStandby(t)
+		before := baseFrom(s)
+		if err := s.updateConfig(func(c *config.Config) {
+			c.IPBans = []config.IPBan{{IP: "10.1.1.1", CreatedAt: 42}}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, err := s.commitPulledConfig(primaryRemote, remoteRev, before, remoteRev)
+		if !errors.Is(err, errPullBaseMoved) {
+			t.Fatalf("want errPullBaseMoved, got %v", err)
+		}
+	})
+
+	t.Run("primary revision moved rejects", func(t *testing.T) {
+		s := newStandby(t)
+		_, _, _, err := s.commitPulledConfig(primaryRemote, remoteRev, baseFrom(s), remoteRev+"-newer")
+		if !errors.Is(err, errPullRemoteMoved) {
+			t.Fatalf("want errPullRemoteMoved, got %v", err)
+		}
+		if got := s.cfg().Services; len(got) != 1 || got[0].Name != "stale" {
+			t.Errorf("rejected commit must leave config untouched: %+v", got)
+		}
+	})
+
+	t.Run("save failure keeps old memory version", func(t *testing.T) {
+		s := newStandby(t)
+		// Repoint the config path at an existing directory: temp write
+		// succeeds, rename over the dir fails.
+		blocked := filepath.Join(t.TempDir(), "config.json")
+		if err := os.Mkdir(blocked, 0755); err != nil {
+			t.Fatal(err)
+		}
+		s.configPath = blocked
+		ptrBefore := s.cfg()
+		_, _, changed, err := s.commitPulledConfig(primaryRemote, remoteRev, baseFrom(s), remoteRev)
+		if err == nil || isPullConflict(err) || changed {
+			t.Fatalf("want non-conflict save error, got changed=%v err=%v", changed, err)
+		}
+		if s.cfg() != ptrBefore {
+			t.Error("memory swapped despite failed save")
+		}
+		if got := s.cfg().Services; len(got) != 1 || got[0].Name != "stale" {
+			t.Errorf("memory content changed despite failed save: %+v", got)
+		}
+	})
+}
+
+// TestPullRecoveryKeepsUnchangedProbesAndHistory is AC-7: a shared-only pull
+// must converge via the narrow monitor paths — unchanged vantages keep their
+// exact poll loops and check rows/history (local and external) survive.
+func TestPullRecoveryKeepsUnchangedProbesAndHistory(t *testing.T) {
+	// Dummy agent endpoint: the poll loop is allowed to run, but with a long
+	// interval it does not matter what it answers during the test.
+	probeTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer probeTS.Close()
+
+	keepCheck := config.ServiceCheck{Name: "svc:keep", Type: "http", Target: "http://keep.example", Enabled: true}
+
+	primary := newTestServer(t, &config.Config{
+		PeerID:        "site-a",
+		ConfigPrimary: true,
+		Services:      []config.Service{{Name: "grafana"}},
+		ServiceChecks: []config.ServiceCheck{keepCheck},
+		VPNRange:      "10.100.0.0/24",
+	})
+	primaryAddr := startPeerHTTPServer(t, primary)
+
+	nonPrimary := newTestServer(t, &config.Config{
+		PeerID:        "site-b",
+		ConfigPrimary: false,
+		Peers:         []config.Peer{{ID: "site-a", WGAddr: primaryAddr, Primary: true}},
+		Services:      []config.Service{{Name: "stale"}},
+		ServiceChecks: []config.ServiceCheck{keepCheck},
+		RemoteProbes: []config.RemoteProbe{{
+			Name: "v", Mode: "pull", URL: probeTS.URL, Token: "tok", Enabled: true, Poll: 3600,
+		}},
+		VPNRange: "10.100.0.0/24",
+	})
+	t.Cleanup(func() { nonPrimary.monitor.Stop() })
+
+	// Bring the vantage loop up the way server Start would, and seed history
+	// for both a local check and an external vantage row. The goroutine
+	// identity guarantee itself is asserted white-box in the monitor package
+	// (TestReloadRemotesPreservesLoopIdentity); here we assert the
+	// user-visible consequence: rows and history survive a shared-only pull.
+	mon := nonPrimary.monitor
+	mon.ReloadRemotes(nonPrimary.cfg())
+	mon.SeedForTest("svc:keep", "http", "http://keep.example")
+	mon.SeedForTest("ext:v:https://keep.example", "https", "https://keep.example")
+
+	nonPrimary.pullConfigOnce()
+
+	// Shared state converged.
+	if got := nonPrimary.cfg().Services; len(got) != 1 || got[0].Name != "grafana" {
+		t.Fatalf("services not converged: %+v", got)
+	}
+
+	// The local-only vantage config survived the merge.
+	if probes := nonPrimary.cfg().RemoteProbes; len(probes) != 1 || probes[0].Name != "v" {
+		t.Errorf("remote probe config lost in pull merge: %+v", probes)
+	}
+
+	// Rows and history for the unchanged local check and vantage remain —
+	// the blunt monitor.Reload path would have deleted both.
+	if mon.GetStatus("svc:keep") == nil {
+		t.Error("local check status wiped by pull recovery")
+	}
+	if h := mon.GetHistory("svc:keep"); len(h) != 1 {
+		t.Errorf("local check history wiped: %+v", h)
+	}
+	if mon.GetStatus("ext:v:https://keep.example") == nil {
+		t.Error("external vantage status row wiped by pull recovery")
+	}
+	if h := mon.GetHistory("ext:v:https://keep.example"); len(h) != 1 {
+		t.Errorf("external vantage history wiped: %+v", h)
+	}
+}
+
+// TestRecoverDerivedStateErrors verifies the recovery step aggregates and
+// reports failures (via the test-only hook) and is nil when every step is
+// healthy.
+func TestRecoverDerivedStateErrors(t *testing.T) {
+	t.Run("healthy recovery is nil", func(t *testing.T) {
+		s := newTestServer(t, &config.Config{VPNRange: "10.100.0.0/24"})
+		if err := s.recoverDerivedState(s.cfg(), s.cfg()); err != nil {
+			t.Fatalf("unexpected recovery error: %v", err)
+		}
+	})
+
+	t.Run("failing step is reported", func(t *testing.T) {
+		s := newTestServer(t, &config.Config{VPNRange: "10.100.0.0/24"})
+		postPullRecoveryHook = func(*config.Config) error { return errors.New("injected recovery fault") }
+		defer func() { postPullRecoveryHook = nil }()
+
+		err := s.recoverDerivedState(s.cfg(), s.cfg())
+		if err == nil {
+			t.Fatal("want recovery error, got nil")
+		}
+		if !strings.Contains(err.Error(), "injected recovery fault") {
+			t.Errorf("error should identify the failing step, got %v", err)
+		}
+	})
+}
+
+// TestPeerConfigConditionalFetch verifies the ETag/304 protocol on the
+// primary side and the fetchPeerConfig helper, including fallback to a legacy
+// primary that sends no ETag.
+func TestPeerConfigConditionalFetch(t *testing.T) {
+	primary := newTestServer(t, &config.Config{
+		PeerID:        "site-a",
+		ConfigPrimary: true,
+		Services:      []config.Service{{Name: "grafana"}},
+		VPNRange:      "10.100.0.0/24",
+	})
+	addr := startPeerHTTPServer(t, primary)
+	cfgURL := "http://" + addr + "/api/peer/config"
+	wantRev := sharedConfigDigest(primary.cfg())
+
+	// 1. Unconditional fetch: 200 + ETag carrying the shared revision.
+	body, rev, notModified, err := fetchPeerConfig(cfgURL, "")
+	if err != nil {
+		t.Fatalf("unconditional fetch: %v", err)
+	}
+	if notModified {
+		t.Error("plain fetch unexpectedly returned 304")
+	}
+	if rev != wantRev {
+		t.Errorf("ETag rev=%q want %q", rev, wantRev)
+	}
+	if len(body) == 0 {
+		t.Error("200 response had empty body")
+	}
+
+	// 2. Conditional fetch with the current revision: 304, no body.
+	body2, rev2, notModified2, err := fetchPeerConfig(cfgURL, wantRev)
+	if err != nil {
+		t.Fatalf("conditional fetch: %v", err)
+	}
+	if !notModified2 {
+		t.Error("matching If-None-Match should yield 304")
+	}
+	if body2 != nil {
+		t.Errorf("304 must carry no body, got %d bytes", len(body2))
+	}
+	if rev2 != wantRev {
+		t.Errorf("304 ETag rev=%q want %q", rev2, wantRev)
+	}
+
+	// 3. Stale revision: full 200 again.
+	if _, _, notModified3, err := fetchPeerConfig(cfgURL, "deadbeef"); err != nil || notModified3 {
+		t.Errorf("stale revision: notModified=%v err=%v, want 200", notModified3, err)
+	}
+
+	// 4. Ping carries the same revision.
+	ping, err := fetchPeerPing("http://" + addr + "/api/peer/ping")
+	if err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if ping.SharedRev != wantRev {
+		t.Errorf("ping shared_rev=%q want %q", ping.SharedRev, wantRev)
+	}
+}
+
+// TestFetchPeerConfigLegacyPrimary confirms mixed-version behavior: an older
+// primary answering 200 without ETag still converges the client — the helper
+// reports rev="" and the caller computes the digest from the body.
+func TestFetchPeerConfigLegacyPrimary(t *testing.T) {
+	legacyCfg := &config.Config{
+		PeerID:        "site-a",
+		ConfigPrimary: true,
+		Services:      []config.Service{{Name: "legacy-svc"}},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately ignore If-None-Match and send no ETag.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(legacyCfg)
+	}))
+	defer ts.Close()
+
+	body, rev, notModified, err := fetchPeerConfig(ts.URL, "anything")
+	if err != nil {
+		t.Fatalf("legacy fetch: %v", err)
+	}
+	if notModified || rev != "" {
+		t.Errorf("legacy primary: notModified=%v rev=%q, want false/empty", notModified, rev)
+	}
+	got, err := config.LoadFromJSON(body)
+	if err != nil {
+		t.Fatalf("parse legacy body: %v", err)
+	}
+	if len(got.Services) != 1 || got.Services[0].Name != "legacy-svc" {
+		t.Errorf("legacy body services = %+v", got.Services)
+	}
+	if d := sharedConfigDigest(got); d == "" {
+		t.Error("digest must be derivable from the legacy body")
+	}
+}
+
+// digestTestCfg fills EVERY local-only field with non-zero, distinguishable
+// values so the field-surfaces-in-JSON checks below are meaningful. The
+// suffix selects the "local" vs "remote" variant.
+func digestTestCfg(suffix string) *config.Config {
+	return &config.Config{
+		PeerID: "peer-" + suffix,
+		// Both variants must serialize the key (omitempty) AND differ, so
+		// the pin test can prove the local value wins.
+		ConfigPrimary:       suffix == "local",
+		Peers:               []config.Peer{{ID: "peer-other-" + suffix, WGAddr: "10.0.0." + suffix, Primary: suffix == "local"}},
+		ListenAddr:          ":808" + suffix[:1],
+		WGInterface:         "wg-" + suffix,
+		WGConfigPath:        "/etc/wireguard/wg-" + suffix + ".conf",
+		ServerEndpoint:      suffix + ".example.com:51820",
+		ServerPublicKey:     "pubkey-" + suffix,
+		LocalInterface:      "192.168.0." + suffix[:1],
+		AdminToken:          "token-" + suffix,
+		PublicIP:            "203.0.113." + suffix[:1],
+		PublicIPOverride:    "198.51.100." + suffix[:1],
+		PublicIPLastChecked: 1700000000 + int64(len(suffix)),
+		LastLocalIface:      "eth" + suffix,
+		LastLanCIDR:         "192.168." + suffix[:1] + ".0/24",
+		BlessedIPTablesRules: []string{
+			"-A INPUT -s 192.168." + suffix[:1] + ".0/24 -j ACCEPT",
+		},
+		RemoteProbes: []config.RemoteProbe{{
+			Name: "vantage-" + suffix, Token: "probe-token-" + suffix, Enabled: true,
+		}},
+		LastPublishedRecords: map[string][]string{
+			"example.com|" + suffix + "|A": {"203.0.113." + suffix[:1]},
+		},
+		DNSDriftBlocked: true,
+		DNSDriftDetail: &config.DNSDriftInfo{
+			Zone: "example.com", Name: suffix, Type: "A",
+			Live:       []string{"203.0.113." + suffix[:1]},
+			Expected:   []string{"198.51.100." + suffix[:1]},
+			Reason:     config.DNSConflictOutOfBand,
+			DetectedAt: 1700000000 + int64(len(suffix)),
+		},
+	}
+}
+
+func TestSharedConfigDigest(t *testing.T) {
+	base := digestTestCfg("local")
+
+	// Stable across repeated calls.
+	d1 := sharedConfigDigest(base)
+	d2 := sharedConfigDigest(base)
+	if d1 == "" || d1 != d2 {
+		t.Fatalf("digest not stable: %q vs %q", d1, d2)
+	}
+
+	// Any change to a local-only field (identity, topology, host plumbing,
+	// caches, drift block, probes, ...) must NOT move the shared revision.
+	for name, mutate := range map[string]func(*config.Config){
+		"peer_id":                func(c *config.Config) { c.PeerID = "peer-changed" },
+		"config_primary":         func(c *config.Config) { c.ConfigPrimary = false },
+		"peers":                  func(c *config.Config) { c.Peers = []config.Peer{{ID: "brand-new-peer"}} },
+		"listen_addr":            func(c *config.Config) { c.ListenAddr = ":9999" },
+		"wg_interface":           func(c *config.Config) { c.WGInterface = "wg9" },
+		"wg_config_path":         func(c *config.Config) { c.WGConfigPath = "/etc/wireguard/wg9.conf" },
+		"server_endpoint":        func(c *config.Config) { c.ServerEndpoint = "changed:51820" },
+		"server_public_key":      func(c *config.Config) { c.ServerPublicKey = "other-pub" },
+		"local_interface":        func(c *config.Config) { c.LocalInterface = "10.1.1.1" },
+		"admin_token":            func(c *config.Config) { c.AdminToken = "rotated" },
+		"public_ip":              func(c *config.Config) { c.PublicIP = "198.51.100.77" },
+		"public_ip_override":     func(c *config.Config) { c.PublicIPOverride = "198.51.100.78" },
+		"public_ip_last_checked": func(c *config.Config) { c.PublicIPLastChecked += 3600 },
+		"last_local_iface":       func(c *config.Config) { c.LastLocalIface = "eth9" },
+		"last_lan_cidr":          func(c *config.Config) { c.LastLanCIDR = "10.9.0.0/24" },
+		"blessed":                func(c *config.Config) { c.BlessedIPTablesRules = []string{"-A FOO"} },
+		"remote_probes":          func(c *config.Config) { c.RemoteProbes[0].Token = "new-token" },
+		"last_published":         func(c *config.Config) { c.LastPublishedRecords = map[string][]string{"x|y|A": {"1.2.3.4"}} },
+		"dns_drift":              func(c *config.Config) { c.DNSDriftBlocked = false; c.DNSDriftDetail = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := *base
+			mutate(&changed)
+			if got := sharedConfigDigest(&changed); got != d1 {
+				t.Errorf("digest changed with local-only mutation %s: %q vs %q", name, got, d1)
+			}
+		})
+	}
+
+	// Shared edits of every replicated shape must move the revision.
+	for name, mutate := range map[string]func(*config.Config){
+		"services": func(c *config.Config) {
+			c.Services = []config.Service{{Name: "brand-new-service"}}
+		},
+		"zones": func(c *config.Config) {
+			c.Zones = []config.Zone{{Name: "new.example"}}
+		},
+		"settings": func(c *config.Config) { c.HAProxyHTTPPort++ },
+		"wg_peers": func(c *config.Config) {
+			c.WGPeers = []config.WGPeer{{Name: "carol", PublicKey: "carol-pub"}}
+		},
+		"ip_bans": func(c *config.Config) {
+			c.IPBans = []config.IPBan{{IP: "10.1.1.1", CreatedAt: 123}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := *base
+			mutate(&changed)
+			if got := sharedConfigDigest(&changed); got == d1 {
+				t.Errorf("digest unchanged after shared mutation %s", name)
+			}
+		})
+	}
+
+	// Two configs differing ONLY in local-only fields share a revision.
+	remote := digestTestCfg("remote")
+	if got := sharedConfigDigest(remote); got != d1 {
+		t.Errorf("same shared state, different local-only state: digests differ %q vs %q", got, d1)
+	}
+}
+
+// TestLocalOnlyKeysArePinned enforces that every key in localOnlyConfigKeys is
+// actually pinned by mergeRemoteIntoLocal, so a new per-instance field cannot
+// land in the digest list without also surviving a pull.
+func TestLocalOnlyKeysArePinned(t *testing.T) {
+	local := digestTestCfg("local")
+	remote := digestTestCfg("remote")
+	merged := mergeRemoteIntoLocal(remote, local)
+
+	toMap := func(c *config.Config) map[string]json.RawMessage {
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		m := map[string]json.RawMessage{}
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return m
+	}
+	localMap := toMap(local)
+	mergedMap := toMap(merged)
+
+	for key := range localOnlyConfigKeys {
+		lv, lok := localMap[key]
+		mv, mok := mergedMap[key]
+		if !lok {
+			t.Errorf("test setup: local-only key %q not present in local JSON", key)
+			continue
+		}
+		if !mok {
+			t.Errorf("local-only key %q missing from merged config", key)
+			continue
+		}
+		if string(mv) != string(lv) {
+			t.Errorf("local-only key %q not pinned by mergeRemoteIntoLocal:\n  local:  %s\n  merged: %s", key, lv, mv)
 		}
 	}
 }

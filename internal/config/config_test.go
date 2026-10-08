@@ -127,8 +127,78 @@ func TestSave(t *testing.T) {
 		t.Errorf("Expected saved listen addr :9999, got %s", loadedCfg.ListenAddr)
 	}
 
-	if loadedCfg.WGInterface != "savetest" {
-		t.Errorf("Expected saved wg interface savetest, got %s", loadedCfg.WGInterface)
+	// Save overwrites an existing file in place.
+	cfg.WGInterface = "savetest-2"
+	if err := Save(configPath, cfg); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if reloaded, err := Load(configPath); err != nil || reloaded.WGInterface != "savetest-2" {
+		t.Fatalf("reload after overwrite: cfg=%+v err=%v", reloaded, err)
+	}
+
+	// Atomic write leaves no temp files behind and keeps 0600.
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Errorf("residual temp file after Save: %s", e.Name())
+		}
+	}
+	if info, err := os.Stat(configPath); err != nil || info.Mode().Perm() != 0600 {
+		t.Errorf("config mode = %v, err = %v; want 0600", info.Mode().Perm(), err)
+	}
+}
+
+// TestSaveFailureLeavesPreviousIntact verifies that when the atomic write
+// cannot land (target path is itself a directory, so rename fails — the same
+// class of failure as an unwritable path), the previous config file is
+// untouched and still parses.
+func TestSaveFailureLeavesPreviousIntact(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// A valid file first.
+	goodPath := filepath.Join(tmpDir, "config.json")
+	if err := Save(goodPath, Default()); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	original, err := os.ReadFile(goodPath)
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+
+	// Target path is an existing directory: CreateTemp inside it works (the
+	// dir is writable), but renaming a file over a non-empty/existing *dir*
+	// fails — exercising the error path after the temp write.
+	blocking := filepath.Join(tmpDir, "blocked")
+	if err := os.Mkdir(blocking, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := Default()
+	cfg.WGInterface = "should-not-land"
+	if err := Save(blocking, cfg); err == nil {
+		t.Fatal("expected Save over a directory to fail, got nil")
+	}
+
+	// No residual temp file in the directory.
+	entries, err := os.ReadDir(blocking)
+	if err != nil {
+		t.Fatalf("read blocked dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Errorf("residual temp file after failed Save: %s", e.Name())
+		}
+	}
+
+	// The unrelated good file survived byte-for-byte.
+	after, err := os.ReadFile(goodPath)
+	if err != nil {
+		t.Fatalf("read good file: %v", err)
+	}
+	if string(after) != string(original) {
+		t.Error("previously saved config was modified by a failed Save elsewhere")
 	}
 }
 

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -294,6 +295,39 @@ func TestSameRemoteProbe(t *testing.T) {
 				t.Fatalf("a change to %s must force a restart — the loop reads it once at start", name)
 			}
 		})
+	}
+}
+
+// TestReloadRemotesPreservesLoopIdentity is the precise AC-7 guard at the
+// scheduler level: when the pull loop runs ReloadRemotes with an unchanged
+// vantage set (RemoteProbes are local-only and pinned through a pull), the
+// existing poll loop must be the SAME goroutine — not cancelled and
+// recreated on every 30s pull.
+func TestReloadRemotesPreservesLoopIdentity(t *testing.T) {
+	base := probeCfg()
+	a := config.RemoteProbe{Name: "a", Mode: config.ProbeModePull, URL: "http://127.0.0.1:1", Token: "t", Enabled: true, Poll: 3600}
+	c1 := *base
+	c1.RemoteProbes = []config.RemoteProbe{a}
+	m := New(&c1)
+	defer m.Stop()
+
+	m.ReloadRemotes(&c1)
+	m.mu.RLock()
+	before := reflect.ValueOf(m.remoteCancel["a"]).Pointer()
+	m.mu.RUnlock()
+
+	// Caller changed an unrelated shared setting somewhere; probe list is
+	// byte-identical.
+	c2 := *base
+	c2.HAProxyHTTPPort = 81
+	c2.RemoteProbes = []config.RemoteProbe{a}
+	m.ReloadRemotes(&c2)
+
+	m.mu.RLock()
+	after := reflect.ValueOf(m.remoteCancel["a"]).Pointer()
+	m.mu.RUnlock()
+	if before != after {
+		t.Fatal("unchanged vantage loop was torn down and restarted")
 	}
 }
 

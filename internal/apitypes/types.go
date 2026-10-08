@@ -33,16 +33,28 @@ type DashboardResponse struct {
 	PeerSync *PeerSyncStatus `json:"peerSync,omitempty"`
 }
 
+// Peer sync round classifications. Mirrors server.pullState — the UI keys
+// its color/copy off state rather than the error string presence.
+const (
+	PullStateSynced        = "synced"         // round completed (applied or up to date)
+	PullStateFetchFailed   = "fetch_failed"   // primary unreachable / body invalid / split-config refusal
+	PullStateConflict      = "conflict"       // fetched body was stale and discarded (retried or role ended)
+	PullStateRecoverFailed = "recover_failed" // durable save or derived recovery failed; replay pending
+)
+
 // PeerSyncStatus surfaces the peer-sync pull-loop state to the dashboard so
 // operators can spot a non-primary that has stopped converging without
 // having to scrape logs. See plan/plan.md Phase 1 hardening item 5.
 type PeerSyncStatus struct {
 	PrimaryID     string `json:"primaryId"`               // peer id this instance is pulling from
-	PullCount     int    `json:"pullCount"`               // total pull attempts since startup
+	State         string `json:"state"`                   // synced | fetch_failed | conflict | recover_failed
+	PullCount     int    `json:"pullCount"`               // total pull rounds since startup
 	LastPullAt    int64  `json:"lastPullAt,omitempty"`    // unix seconds, 0 if never
 	LastSuccessAt int64  `json:"lastSuccessAt,omitempty"` // unix seconds, 0 if never
 	LastApplyAt   int64  `json:"lastApplyAt,omitempty"`   // unix seconds, 0 if never
-	LastError     string `json:"lastError,omitempty"`     // empty if last attempt succeeded
+	LastError     string `json:"lastError,omitempty"`     // detail for the current non-synced state
+	ConflictCount int    `json:"conflictCount,omitempty"` // stale bodies discarded since startup
+	LastConflictAt int64 `json:"lastConflictAt,omitempty"` // unix seconds of last discarded body
 }
 
 // Services
@@ -1236,6 +1248,7 @@ type HAFleetPeer struct {
 	Online          bool             `json:"online,omitempty"`
 	LastSyncAt      string           `json:"lastSyncAt,omitempty"`
 	LastSyncErr     string           `json:"lastSyncErr,omitempty"`
+	SyncState       string           `json:"syncState,omitempty"` // synced | fetch_failed | conflict | recover_failed (self, non-primary)
 	IPTablesSummary *IPTablesSummary `json:"iptables_summary,omitempty"` // peer's local rule classification counts
 }
 

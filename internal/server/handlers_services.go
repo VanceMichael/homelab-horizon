@@ -15,8 +15,12 @@ import (
 	"github.com/iodesystems/homelab-horizon/internal/route53"
 )
 
-// syncServices syncs all subsystems with current service configuration (quick, no logging)
-func (s *Server) syncServices() {
+// syncServices syncs all subsystems with current service configuration
+// (quick, no logging on the happy path). Every failed derivation step is both
+// logged and returned (joined), so the peer-sync recovery path can report a
+// half-applied state instead of swallowing it — callers that only need the
+// best-effort behavior may ignore the returned error.
+func (s *Server) syncServices() error {
 	// Opportunistic public-IP refresh: if the cache is stale, kick off a
 	// background fetch so the next derived-records call sees a current IP.
 	// Non-blocking — mutation handlers should not stall on external HTTP.
@@ -31,13 +35,17 @@ func (s *Server) syncServices() {
 		s.monitor.RefreshChecks(s.cfg())
 	}
 
+	var recoverErrs []error
+
 	// Update DNSMasq
 	if s.cfg().DNSMasqEnabled {
 		if err := s.dns.SetRecords(s.cfg().DeriveDNSRecords()); err != nil {
 			slog.Warn("dns.SetMappings", "err", err)
+			recoverErrs = append(recoverErrs, fmt.Errorf("dnsmasq records: %w", err))
 		}
 		if err := s.dns.Reload(); err != nil {
 			slog.Warn("dns.Reload", "err", err)
+			recoverErrs = append(recoverErrs, fmt.Errorf("dnsmasq reload: %w", err))
 		}
 	}
 
@@ -50,9 +58,11 @@ func (s *Server) syncServices() {
 		}
 		if err := s.haproxy.WriteConfig(s.cfg().HAProxyHTTPPort, s.cfg().HAProxyHTTPSPort, sslConfig); err != nil {
 			slog.Warn("haproxy.WriteConfig", "err", err)
+			recoverErrs = append(recoverErrs, fmt.Errorf("haproxy write-config: %w", err))
 		}
 		if err := s.haproxy.Reload(); err != nil {
 			slog.Warn("haproxy.Reload", "err", err)
+			recoverErrs = append(recoverErrs, fmt.Errorf("haproxy reload: %w", err))
 		}
 	}
 
@@ -62,6 +72,8 @@ func (s *Server) syncServices() {
 		CertDir:        s.cfg().SSLCertDir,
 		HAProxyCertDir: s.cfg().SSLHAProxyCertDir,
 	})
+
+	return errors.Join(recoverErrs...)
 }
 
 // BroadcastSyncLogger sends log messages to the sync broadcaster

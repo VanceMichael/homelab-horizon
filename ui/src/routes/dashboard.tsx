@@ -16,8 +16,43 @@ import CancelIcon from "@mui/icons-material/Cancel";
 import InfoIcon from "@mui/icons-material/Info";
 import SyncIcon from "@mui/icons-material/Sync";
 import SyncProblemIcon from "@mui/icons-material/SyncProblem";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import { useDashboard } from "../api/hooks";
 import type { PeerSyncStatus } from "../api/generated-types";
+
+// pullState presentation: the four outcomes the backend's commit point can
+// report, with distinct color/copy so a stale conflict and a failed recovery
+// never read as a healthy spare.
+type PeerSyncPresentation = {
+  label: string;
+  severity: "success" | "warning" | "error";
+  icon: "sync" | "warn" | "problem";
+};
+
+const peerSyncPresentation: Record<string, PeerSyncPresentation> = {
+  synced: { label: "Synced", severity: "success", icon: "sync" },
+  conflict: {
+    label: "Concurrent change — stale result discarded",
+    severity: "warning",
+    icon: "warn",
+  },
+  fetch_failed: {
+    label: "Cannot reach primary",
+    severity: "error",
+    icon: "problem",
+  },
+  recover_failed: {
+    label: "Config saved, but services not fully applied",
+    severity: "error",
+    icon: "problem",
+  },
+};
+
+const peerSyncPresentationFallback: PeerSyncPresentation = {
+  label: "Unknown sync state",
+  severity: "error",
+  icon: "problem",
+};
 
 function StatusDot({ active }: { active: boolean }) {
   return (
@@ -45,20 +80,45 @@ function formatRelative(unixSeconds: number | undefined): string {
 }
 
 function PeerSyncTile({ status }: { status: PeerSyncStatus }) {
-  const healthy = !status.lastError;
+  const pres =
+    peerSyncPresentation[status.state] ?? peerSyncPresentationFallback;
+  const iconColor =
+    pres.severity === "success"
+      ? "success.main"
+      : pres.severity === "warning"
+        ? "warning.main"
+        : "error.main";
+  const Icon =
+    pres.icon === "sync"
+      ? SyncIcon
+      : pres.icon === "warn"
+        ? WarningAmberIcon
+        : SyncProblemIcon;
+  const showDetail = status.state !== "synced" && !!status.lastError;
+
   return (
     <Paper sx={{ p: 3, mb: 3 }}>
       <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
-        {healthy ? (
-          <SyncIcon sx={{ color: "success.main" }} />
-        ) : (
-          <SyncProblemIcon sx={{ color: "error.main" }} />
-        )}
+        <Icon sx={{ color: iconColor }} />
         <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
           Config sync from {status.primaryId}
         </Typography>
+        <Typography
+          variant="caption"
+          sx={{
+            ml: 1,
+            px: 1,
+            py: 0.25,
+            borderRadius: 1,
+            color: `${pres.severity}.contrastText`,
+            bgcolor: `${pres.severity}.main`,
+          }}
+        >
+          {pres.label}
+        </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ ml: "auto" }}>
           {status.pullCount} pull{status.pullCount === 1 ? "" : "s"}
+          {status.conflictCount ? ` · ${status.conflictCount} conflict${status.conflictCount === 1 ? "" : "s"}` : ""}
         </Typography>
       </Box>
       <Box
@@ -66,7 +126,7 @@ function PeerSyncTile({ status }: { status: PeerSyncStatus }) {
           display: "grid",
           gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr 1fr" },
           gap: 1,
-          mb: status.lastError ? 1 : 0,
+          mb: showDetail ? 1 : 0,
         }}
       >
         <Box>
@@ -88,9 +148,17 @@ function PeerSyncTile({ status }: { status: PeerSyncStatus }) {
           <Typography variant="body2">{formatRelative(status.lastApplyAt)}</Typography>
         </Box>
       </Box>
-      {status.lastError && (
-        <Alert severity="error" sx={{ mt: 1 }}>
+      {showDetail && (
+        <Alert
+          severity={pres.severity}
+          sx={{ mt: 1 }}
+        >
           {status.lastError}
+          {status.state === "recover_failed"
+            ? " — config is durably on disk; convergence will be retried automatically."
+            : status.state === "conflict"
+              ? " — the pull was retried with current state or ended for the new role."
+              : ""}
         </Alert>
       )}
     </Paper>

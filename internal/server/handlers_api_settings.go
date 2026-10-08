@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -306,7 +307,9 @@ func (s *Server) handleAPIDeleteZone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.syncServices()
+	if err := s.syncServices(); err != nil {
+		slog.Warn("derived services reload reported errors", "err", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }

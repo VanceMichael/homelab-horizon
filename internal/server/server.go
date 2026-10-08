@@ -184,26 +184,136 @@ type configShare struct {
 	QRCode   string
 }
 
+// pullState classifies the outcome of a non-primary pull round so the
+// dashboard and HA status can tell fetch failures, concurrent conflicts and
+// recovery failures apart from a genuinely completed sync.
+type pullState string
+
+const (
+	// pullStateSynced: round completed — either a new revision was committed
+	// and fully recovered, or there was nothing new to do.
+	pullStateSynced pullState = "synced"
+	// pullStateFetchFailed: could not obtain/validate the primary's config
+	// (unreachable, split-config guard, parse/fleet validation).
+	pullStateFetchFailed pullState = "fetch_failed"
+	// pullStateConflict: the fetched body was stale at the commit point
+	// (role/topology/local base/primary revision moved) and was discarded;
+	// the round retried or ended for the new role.
+	pullStateConflict pullState = "conflict"
+	// pullStateRecoverFailed: the config was not durably committed (save
+	// failed — live state unchanged) or it was committed but derived
+	// subsystems failed to converge; a later round replays recovery.
+	pullStateRecoverFailed pullState = "recover_failed"
+)
+
 // peerSyncStatus records the most recent peer-sync pull-loop attempts so the
-// dashboard can surface "last successful pull" without having to scrape logs.
+// dashboard can surface "last successful pull" without scraping logs.
 // Updated by pullConfigOnce, read by handleAPIDashboard.
 type peerSyncStatus struct {
-	mu            sync.RWMutex
-	pullCount     int       // total pull attempts since startup
-	lastPullAt    time.Time // timestamp of last attempt (success OR failure)
-	lastSuccessAt time.Time // timestamp of last successful ping+fetch (regardless of apply)
-	lastApplyAt   time.Time // timestamp of last config swap (only set when apply succeeds)
-	lastError     string    // empty when last attempt succeeded
+	mu sync.RWMutex
+
+	pullCount     int       // total pull rounds since startup
+	lastPullAt    time.Time // timestamp of last round (success OR failure)
+	lastSuccessAt time.Time // timestamp of last fully completed round
+	lastApplyAt   time.Time // timestamp of last durable config commit (swap)
+	lastError     string    // detail for the current non-synced state
+	state         pullState // classified outcome of the last round
+
+	// committedRev/recoveredRev track convergence across rounds: when a
+	// durable commit lands but derived recovery fails, they differ and the
+	// next round replays recovery even if the primary answers 304.
+	committedRev   string
+	recoveredRev   string
+	conflictCount  int
+	lastConflictAt time.Time
+}
+
+// ensureInit seeds the revision bookkeeping on first use with the digest of
+// the config the process booted from (subsystems were derived from it, so it
+// is both committed and recovered). Idempotent.
+func (p *peerSyncStatus) ensureInit(rev string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.committedRev == "" {
+		p.committedRev = rev
+		p.recoveredRev = rev
+		if p.state == "" {
+			p.state = pullStateSynced
+		}
+	}
+}
+
+func (p *peerSyncStatus) setCommitted(rev string, at time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.committedRev = rev
+	p.lastApplyAt = at
+}
+
+func (p *peerSyncStatus) setRecovered(rev string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recoveredRev = rev
+}
+
+// noteConflict accounts for one discarded pull attempt at the moment it is
+// rejected — even when the round immediately retries and ends synced, the
+// dashboard gets to see that a stale body was thrown away.
+func (p *peerSyncStatus) noteConflict() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conflictCount++
+	p.lastConflictAt = time.Now()
+}
+
+// markInSync records that both committed and recovered state are at rev
+// WITHOUT touching timestamps — for rounds that fetched a body ending in a
+// no-op (content already present), which must not look like an apply.
+func (p *peerSyncStatus) markInSync(rev string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.committedRev = rev
+	p.recoveredRev = rev
+}
+
+func (p *peerSyncStatus) snapshotLocked() (committed, recovered string, recoveryPending bool) {
+	return p.committedRev, p.recoveredRev, p.committedRev != "" && p.committedRev != p.recoveredRev
+}
+
+// recoveryPending reports whether a committed revision has not finished
+// derived recovery and therefore needs replay this round.
+func (p *peerSyncStatus) recoveryPending() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, _, pending := p.snapshotLocked()
+	return pending
+}
+
+func (p *peerSyncStatus) committedRevision() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.committedRev
 }
 
 type Server struct {
-	// config is swapped atomically by applyNewConfig (peer-sync pull loop).
-	// Always access via s.cfg() — never read the field directly outside the
-	// few helpers below. In-place mutation of the pointed-to Config is still
-	// racy with concurrent handler reads; that pre-existing race is tracked
-	// separately and out of scope for this refactor.
+	// config is swapped atomically by updateConfig and the peer-sync commit
+	// point (commitPulledConfig). Always access via s.cfg() — never read the
+	// field directly outside the few helpers below. In-place mutation of the
+	// pointed-to Config is still racy with concurrent handler reads;
+	// mutations themselves are serialized by configMu.
 	config         atomic.Pointer[config.Config]
 	peerSyncStatus peerSyncStatus
+
+	// configMu serializes every config mutation: updateConfig (local writes
+	// from handlers and background jobs) and the peer-sync commit point take
+	// it, so a pull can merge the LATEST local-only state under the same lock
+	// and no local write can land between that merge and the durable save.
+	// Hold it only for in-memory copy + save + atomic swap — never for
+	// network calls or subsystem commands.
+	configMu sync.Mutex
+	// pullMu makes pull rounds non-overlapping (loop vs. future manual
+	// triggers).
+	pullMu sync.Mutex
 
 	// Per-peer traffic samples behind the VPN inactivity timeout. Not in the
 	// config: a measurement rather than a setting. See peer_activity.go.
@@ -488,15 +598,26 @@ func (s *Server) cfg() *config.Config {
 	return s.config.Load()
 }
 
-// updateConfig atomically copies the live config, applies a mutation function,
-// stores the new copy, and persists to disk. This is the sanctioned way to
-// mutate config — it avoids the torn-read race that direct s.cfg().X = Y
-// mutations have with concurrent readers.
+// updateConfig copies the live config, applies a mutation function, persists
+// the result atomically, and only then swaps it in as the live config. This
+// is the sanctioned way to mutate config: it avoids torn reads against
+// concurrent handlers AND lost updates against the peer-sync commit point
+// (both take configMu). Persistence precedes the swap on purpose — a failed
+// save leaves live state exactly where it was, so memory can never hold a
+// version a restart would not reproduce.
+//
+// fn must be a pure in-memory mutation with no I/O or network calls: it runs
+// under configMu.
 func (s *Server) updateConfig(fn func(cfg *config.Config)) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	cfg := *s.cfg()
 	fn(&cfg)
+	if err := config.Save(s.configPath, &cfg); err != nil {
+		return err
+	}
 	s.config.Store(&cfg)
-	return config.Save(s.configPath, &cfg)
+	return nil
 }
 
 func generateToken(length int) string {

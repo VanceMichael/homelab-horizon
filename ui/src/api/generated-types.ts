@@ -32,17 +32,40 @@ export interface DashboardResponse {
   peerSync?: PeerSyncStatus;
 }
 /**
+ * Peer sync round classifications. Mirrors server.pullState — the UI keys
+ * its color/copy off state rather than the error string presence.
+ */
+export const PullStateSynced = "synced"; // round completed (applied or up to date)
+/**
+ * Peer sync round classifications. Mirrors server.pullState — the UI keys
+ * its color/copy off state rather than the error string presence.
+ */
+export const PullStateFetchFailed = "fetch_failed"; // primary unreachable / body invalid / split-config refusal
+/**
+ * Peer sync round classifications. Mirrors server.pullState — the UI keys
+ * its color/copy off state rather than the error string presence.
+ */
+export const PullStateConflict = "conflict"; // fetched body was stale and discarded (retried or role ended)
+/**
+ * Peer sync round classifications. Mirrors server.pullState — the UI keys
+ * its color/copy off state rather than the error string presence.
+ */
+export const PullStateRecoverFailed = "recover_failed"; // durable save or derived recovery failed; replay pending
+/**
  * PeerSyncStatus surfaces the peer-sync pull-loop state to the dashboard so
  * operators can spot a non-primary that has stopped converging without
  * having to scrape logs. See plan/plan.md Phase 1 hardening item 5.
  */
 export interface PeerSyncStatus {
   primaryId: string; // peer id this instance is pulling from
-  pullCount: number /* int */; // total pull attempts since startup
+  state: string; // synced | fetch_failed | conflict | recover_failed
+  pullCount: number /* int */; // total pull rounds since startup
   lastPullAt?: number /* int64 */; // unix seconds, 0 if never
   lastSuccessAt?: number /* int64 */; // unix seconds, 0 if never
   lastApplyAt?: number /* int64 */; // unix seconds, 0 if never
-  lastError?: string; // empty if last attempt succeeded
+  lastError?: string; // detail for the current non-synced state
+  conflictCount?: number /* int */; // stale bodies discarded since startup
+  lastConflictAt?: number /* int64 */; // unix seconds of last discarded body
 }
 export interface HealthCheckResp {
   path: string;
@@ -1180,6 +1203,7 @@ export interface HAFleetPeer {
   online?: boolean;
   lastSyncAt?: string;
   lastSyncErr?: string;
+  syncState?: string; // synced | fetch_failed | conflict | recover_failed (self, non-primary)
   iptables_summary?: IPTablesSummary; // peer's local rule classification counts
 }
 /**

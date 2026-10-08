@@ -27,11 +27,14 @@ export const LoginResponseSchema = z.object({
 // Dashboard
 export const PeerSyncStatusSchema = z.object({
   primaryId: z.string(),
+  state: z.enum(["synced", "fetch_failed", "conflict", "recover_failed"]),
   pullCount: z.number(),
   lastPullAt: z.number().optional(),
   lastSuccessAt: z.number().optional(),
   lastApplyAt: z.number().optional(),
   lastError: z.string().optional(),
+  conflictCount: z.number().optional(),
+  lastConflictAt: z.number().optional(),
 });
 
 export const DashboardDataSchema = z.object({

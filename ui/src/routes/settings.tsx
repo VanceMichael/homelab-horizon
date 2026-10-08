@@ -329,11 +329,48 @@ function HAFleetTab() {
                               color={peer.online ? "success" : "error"}
                               variant="outlined"
                             />
+                            {peer.syncState && peer.syncState !== "synced" && (
+                              <Tooltip
+                                title={
+                                  peer.syncState === "conflict"
+                                    ? "A concurrent change invalidated this pull; it was retried or ended for the new role"
+                                    : peer.syncState === "recover_failed"
+                                      ? "Config was saved on disk but one or more derived services failed to apply; convergence is retried automatically"
+                                      : "Could not fetch or validate the primary's config"
+                                }
+                              >
+                                <Chip
+                                  label={
+                                    peer.syncState === "conflict"
+                                      ? "Sync conflict"
+                                      : peer.syncState === "recover_failed"
+                                        ? "Recovery failed"
+                                        : "Fetch failed"
+                                  }
+                                  size="small"
+                                  color={
+                                    peer.syncState === "conflict"
+                                      ? "warning"
+                                      : "error"
+                                  }
+                                  sx={{ ml: 1 }}
+                                />
+                              </Tooltip>
+                            )}
+                            {peer.syncState === "synced" && (
+                              <Chip
+                                label="Synced"
+                                size="small"
+                                color="success"
+                                variant="outlined"
+                                sx={{ ml: 1 }}
+                              />
+                            )}
                             {peer.lastSyncErr && (
                               <Typography
                                 variant="caption"
                                 color="error"
-                                sx={{ ml: 1 }}
+                                sx={{ ml: 1, display: "block" }}
                               >
                                 {peer.lastSyncErr}
                               </Typography>
