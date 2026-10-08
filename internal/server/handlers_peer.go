@@ -347,6 +347,10 @@ func (s *Server) applyNewConfig(newCfg *config.Config) error {
 		return fmt.Errorf("save: %w", err)
 	}
 
+	// The pulled config may have formally adopted a range this instance
+	// still had leased locally; complete the takeover like any local save.
+	s.reapPortClaims()
+
 	// Re-derive subsystem state (dnsmasq mappings, haproxy backends, LE).
 	s.syncServices()
 

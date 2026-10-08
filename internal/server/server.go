@@ -29,6 +29,7 @@ import (
 	"github.com/iodesystems/homelab-horizon/internal/integration"
 	"github.com/iodesystems/homelab-horizon/internal/letsencrypt"
 	"github.com/iodesystems/homelab-horizon/internal/monitor"
+	"github.com/iodesystems/homelab-horizon/internal/portclaims"
 	"github.com/iodesystems/homelab-horizon/internal/route53"
 	"github.com/iodesystems/homelab-horizon/internal/system"
 	"github.com/iodesystems/homelab-horizon/internal/wireguard"
@@ -252,6 +253,11 @@ type Server struct {
 	installGrants *installGrants
 	joinTokens    *joinTokenStore // HA join tokens
 
+	// portClaims are the durable, short-lived leases `hz ports next` mints
+	// so concurrent callers get disjoint ranges. Nil only when the store
+	// file could not be opened; the mint endpoint then fails closed.
+	portClaims *portclaims.Store
+
 	// peerInstancePaths and peerInstancePrefixes track routes that are
 	// per-instance ops (not shared-config mutations) and therefore exempt
 	// from nonPrimaryGuardMiddleware. Populated only during setupRoutes()
@@ -474,6 +480,20 @@ func NewWithConfig(cfg *config.Config, configPath string, dryRun bool, version s
 	}
 	s.config.Store(cfg)
 	// After the config is stored: the collector reads live server state.
+
+	// Open the durable port-claim store next to the config. Leases survive
+	// restart and are reaped against the freshly-loaded config immediately,
+	// so a range the config has since formally adopted does not survive as a
+	// ghost. An open failure degrades to 503 on mint — never to an unchecked
+	// suggestion the CLI could mistake for an exclusive answer.
+	claimsPath := configPath + ".portclaims.json"
+	if store, err := portclaims.Open(fs, claimsPath); err != nil {
+		slog.Error("port claim store unavailable this run", "path", claimsPath, "error", err)
+	} else {
+		s.portClaims = store
+		s.reapPortClaims()
+	}
+
 	s.promHandler = newPromHandler(s)
 	s.static.Rebuild(cfg)
 	s.initSyncedBaseline()
@@ -496,7 +516,13 @@ func (s *Server) updateConfig(fn func(cfg *config.Config)) error {
 	cfg := *s.cfg()
 	fn(&cfg)
 	s.config.Store(&cfg)
-	return config.Save(s.configPath, &cfg)
+	if err := config.Save(s.configPath, &cfg); err != nil {
+		return err
+	}
+	// A saved config may have just adopted a leased range: complete the
+	// takeover so no claim keeps shadowing the now-formal reservation.
+	s.reapPortClaims()
+	return nil
 }
 
 func generateToken(length int) string {
@@ -1077,6 +1103,8 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/ports", s.handleAPIPorts)
 	mux.HandleFunc("/api/v1/ports/exclusions", s.handleAPIPortExclusions)
 	mux.HandleFunc("/api/v1/ports/observed", s.handleAPIPortsObserved) // what is actually listening
+	mux.HandleFunc("/api/v1/ports/claims", s.handleAPIPortClaim)       // atomic short-lived lease
+	mux.HandleFunc("/api/v1/ports/claims/release", s.handleAPIPortClaimRelease)
 	mux.HandleFunc("/api/v1/dns/drift", s.handleAPIDNSDriftStatus)
 	mux.HandleFunc("/api/v1/dns/drift/clear", s.handleAPIClearDNSDrift)
 	mux.HandleFunc("/api/v1/zones/records", s.handleAPIZoneRecords)
@@ -1650,6 +1678,10 @@ func (s *Server) RunWithTokenCallback(onNewToken func(token string)) error {
 	// Reapply IP bans and start expiry goroutine
 	s.reapplyBans()
 	go s.startBanExpiry()
+
+	// Sweep expired port-claim leases to disk (reads already filter them;
+	// this keeps the state file bounded).
+	go s.startPortClaimJanitor()
 
 	// Start Route53 background sync for dynamic IP records
 	s.startRoute53Sync()

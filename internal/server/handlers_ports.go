@@ -47,6 +47,10 @@ func (s *Server) handleAPIPorts(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.Hosts[host] = out
 	}
+	// Live short-term leases ride along so `ports list` can distinguish
+	// formal occupancy from temporary claims in one read-only call. Tokens
+	// are never included.
+	resp.Claims = s.activeClaimAPIs()
 	writeJSON(w, resp)
 }
 

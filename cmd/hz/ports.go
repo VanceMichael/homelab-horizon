@@ -75,20 +75,24 @@ func isCommonPort(p int) bool {
 
 // runPorts reports port allocation on a host using the server's authoritative
 // port map (service backends, blue-green deploy next-backends, HAProxy,
-// WireGuard, dnsmasq, admin server). Best-effort and advisory: horizon has no
-// port reservation, so this reports free ports you can then use — nothing is
-// reserved.
+// WireGuard, dnsmasq, admin server) plus its short-lived claim store.
+//
+// `ports next` mints an atomic, durable server-side claim: two concurrent
+// callers get disjoint ranges and the lease survives a server restart until
+// it expires, is released, or is reaped once config adopts the range.
 func runPorts(c *client, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: hz ports <next|list> --host IP [--count N] [--from PORT]")
+		return fmt.Errorf("usage: hz ports <next|list|release> --host IP [--count N] [--from PORT]")
 	}
 	switch args[0] {
 	case "next":
 		return runPortsNext(c, args[1:])
 	case "list":
 		return runPortsList(c, args[1:])
+	case "release":
+		return runPortsRelease(c, args[1:])
 	default:
-		return fmt.Errorf("usage: hz ports <next|list> --host IP [--count N] [--from PORT]")
+		return fmt.Errorf("usage: hz ports <next|list|release> --host IP [--count N] [--from PORT]")
 	}
 }
 
@@ -97,6 +101,8 @@ func runPortsNext(c *client, args []string) error {
 	host := fs.String("host", "", "host IP to allocate on (required)")
 	count := fs.Int("count", 1, "size of the contiguous range")
 	from := fs.Int("from", safeBandLow, "lowest port to consider")
+	ttl := fs.Duration("ttl", 10*time.Minute, "how long the claim holds (30s..1h); adopted ranges are reaped on config save")
+	note := fs.String("note", "", "optional label recorded with the claim")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -107,72 +113,72 @@ func runPortsNext(c *client, args []string) error {
 		return fmt.Errorf("--count must be >= 1")
 	}
 
-	pm, err := fetchPortMap(c)
+	// The server does the whole read-scan-claim transaction atomically and
+	// returns the lease credential. There is deliberately no local fallback:
+	// printing a locally-guessed port against a server that cannot claim it
+	// would hand two callers the same "exclusive" answer.
+	var claim apitypes.PortClaimResp
+	req := apitypes.PortClaimRequest{
+		Host:       *host,
+		Proto:      "tcp",
+		Count:      *count,
+		From:       *from,
+		TTLSeconds: int(ttl.Seconds()),
+		Note:       *note,
+	}
+	err := c.do("POST", "/api/v1/ports/claims", req, &claim)
 	if err != nil {
+		if se, ok := err.(*apiStatusError); ok && (se.Code == 404 || se.Code == 405) {
+			return fmt.Errorf("this hz server does not support atomic port claims (no /api/v1/ports/claims); " +
+				"upgrade the server — refusing to print an unchecked port that would look exclusive")
+		}
 		return err
 	}
-	used := usedPorts(pm, *host)
-
-	excluded := excludedFunc(pm)
-
-	// hz's map is what hz was told about. A host also runs things nobody
-	// registered, so the candidate is checked against the host itself before
-	// it is offered — this used to hand out a port a neighbouring daemon
-	// already held, and the service that took the advice could not bind.
-	//
-	// Each rejected candidate is remembered as used, so the search moves past
-	// it rather than proposing it again.
-	for attempt := 0; attempt < 20; attempt++ {
-		base := findFreeRange(used, *from, *count, excluded)
-		if base == 0 {
-			return fmt.Errorf("no free %d-port range >= %d below 65536 on %s (used + common ports excluded)", *count, *from, *host)
-		}
-
-		busy, err := observedInRange(c, *host, base, base+*count-1)
-		if err != nil {
-			// hz could not look. Say so rather than presenting an unchecked
-			// answer as a checked one.
-			fmt.Fprintf(os.Stderr, "hz: could not verify against %s (%v); this range is unchecked\n", *host, err)
-			busy = nil
-		}
-		if len(busy) == 0 {
-			if *count == 1 {
-				fmt.Println(base)
-			} else {
-				fmt.Printf("%d-%d\n", base, base+*count-1)
-			}
-			return nil
-		}
-
-		fmt.Fprintf(os.Stderr, "hz: %d-%d has %v listening but unregistered in hz; looking further\n",
-			base, base+*count-1, busy)
-		for _, p := range busy {
-			used[p] = true
-		}
-		// Everything below the first conflict is settled; resume past it.
-		*from = busy[0] + 1
+	if claim.ID == "" || claim.ExpiresAt == 0 {
+		return fmt.Errorf("server returned no claim; not printing a port")
 	}
-	return fmt.Errorf("gave up after 20 candidates on %s: hz's records and the host disagree too much to allocate; run 'hz ports list --host %s' to see what is actually listening", *host, *host)
+
+	// Stdout stays machine-readable exactly as before — the bare port, or
+	// the bare range. Everything a human wants goes to stderr so existing
+	// scripts (`PORT=$(hz ports next --host …)`) keep working.
+	if claim.From == claim.To {
+		fmt.Println(claim.From)
+	} else {
+		fmt.Printf("%d-%d\n", claim.From, claim.To)
+	}
+	exp := time.Unix(claim.ExpiresAt, 0).Format("15:04:05")
+	fmt.Fprintf(os.Stderr, "hz: CLAIMED %d-%d/%s on %s until %s (id %s)\n",
+		claim.From, claim.To, claim.Proto, claim.Host, exp, claim.ID)
+	fmt.Fprintf(os.Stderr, "hz: release early with: hz ports release --id %s --token %s\n",
+		claim.ID, claim.Token)
+	return nil
 }
 
-// observedUnreserved is what is listening that hz has no record of.
-func observedUnreserved(c *client, host string, from, to int) ([]int, error) {
-	var out apitypes.ObservedPortsResp
-	path := fmt.Sprintf("/api/v1/ports/observed?host=%s&from=%d&to=%d", url.QueryEscape(host), from, to)
-	if err := c.do("GET", path, nil, &out); err != nil {
-		return nil, err
+// runPortsRelease returns a leased range before its TTL. Idempotent: an
+// already-gone claim reports so and exits zero. The credential is what a
+// caller received on stderr from `ports next`; an operator who lost it waits
+// for expiry (at most an hour).
+func runPortsRelease(c *client, args []string) error {
+	fs := flag.NewFlagSet("ports release", flag.ContinueOnError)
+	id := fs.String("id", "", "claim id returned by 'ports next' (required)")
+	token := fs.String("token", "", "claim token returned by 'ports next' (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	return out.Unreserved, nil
-}
-
-// observedInRange asks hz what is actually listening between from and to.
-func observedInRange(c *client, host string, from, to int) ([]int, error) {
-	var out apitypes.ObservedPortsResp
-	path := fmt.Sprintf("/api/v1/ports/observed?host=%s&from=%d&to=%d", url.QueryEscape(host), from, to)
-	if err := c.do("GET", path, nil, &out); err != nil {
-		return nil, err
+	if *id == "" || *token == "" {
+		return fmt.Errorf("--id and --token are required")
 	}
-	return out.Open, nil
+	var out apitypes.PortClaimReleaseResponse
+	if err := c.do("POST", "/api/v1/ports/claims/release",
+		apitypes.PortClaimReleaseRequest{ID: *id, Token: *token}, &out); err != nil {
+		return err
+	}
+	if out.Released {
+		fmt.Printf("released claim %s\n", *id)
+	} else {
+		fmt.Printf("claim %s already gone (expired, released, or adopted into config)\n", *id)
+	}
+	return nil
 }
 
 func runPortsList(c *client, args []string) error {
@@ -197,7 +203,7 @@ func runPortsList(c *client, args []string) error {
 		return portNum(entries[i].Port) < portNum(entries[j].Port)
 	})
 
-	fmt.Printf("USED on %s (%d)\n", *host, len(entries))
+	fmt.Printf("FORMAL RESERVATIONS on %s (%d)\n", *host, len(entries))
 	if len(entries) == 0 {
 		fmt.Println("  (none)")
 	} else {
@@ -207,6 +213,35 @@ func runPortsList(c *client, args []string) error {
 				label += "  " + e.Domain
 			}
 			fmt.Printf("  %-6s %-4s %s\n", e.Port, e.Proto, label)
+		}
+	}
+
+	// Temporary claims: leases minted by `ports next`, distinct from formal
+	// reservations. They expire on their own clock, can be released with
+	// their credential, and disappear once config adopts the range.
+	var hostClaims []apitypes.PortClaimResp
+	for _, cl := range pm.Claims {
+		if cl.Host != *host {
+			continue
+		}
+		hostClaims = append(hostClaims, cl)
+	}
+	sort.Slice(hostClaims, func(i, j int) bool { return hostClaims[i].From < hostClaims[j].From })
+	fmt.Printf("\nTEMPORARY CLAIMS on %s (%d) — short-lived leases from 'hz ports next'\n", *host, len(hostClaims))
+	if len(hostClaims) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, cl := range hostClaims {
+			span := strconv.Itoa(cl.From)
+			if cl.To > cl.From {
+				span = fmt.Sprintf("%d-%d", cl.From, cl.To)
+			}
+			note := ""
+			if cl.Note != "" {
+				note = "  " + cl.Note
+			}
+			fmt.Printf("  %-10s %-4s until %s  %s%s\n",
+				span, cl.Proto, time.Unix(cl.ExpiresAt, 0).Format("15:04:05"), cl.ID, note)
 		}
 	}
 
@@ -235,11 +270,15 @@ func runPortsList(c *client, args []string) error {
 		for _, p := range obs {
 			fmt.Printf("  %-6d tcp  (something is on this port; hz has no record of it)\n", p)
 		}
-		fmt.Println("  These are skipped when suggesting ports, but hz cannot say what they are.")
+		fmt.Println("  These are skipped when suggesting/minting ports, but hz cannot say what they are.")
 	}
 
-	free := suggestFree(usedPorts(pm, *host), *from, *count, excludedFunc(pm))
-	fmt.Printf("\nSUGGESTED FREE (safe band %d–%d, common + excluded ports skipped)\n", safeBandLow, safeBandHigh)
+	// Suggestions remain a pure, read-only view — they create no claim. They
+	// do skip live claims, so an advisory glance never points at a range
+	// another caller is currently holding.
+	free := suggestFree(blockedPorts(pm, *host), *from, *count, excludedFunc(pm))
+	fmt.Printf("\nSUGGESTED FREE (safe band %d–%d, reservations + claims + common/excluded ports skipped; no claim created)\n",
+		safeBandLow, safeBandHigh)
 	if len(free) == 0 {
 		fmt.Println("  (none available)")
 		return nil
@@ -256,6 +295,17 @@ func fetchPortMap(c *client) (apitypes.HostPortMapResponse, error) {
 	var pm apitypes.HostPortMapResponse
 	err := c.do("GET", "/api/v1/ports", nil, &pm)
 	return pm, err
+}
+
+// observedUnreserved is what is listening that hz has no record of — the
+// read-only probe backing the 'ports list' section. It mints nothing.
+func observedUnreserved(c *client, host string, from, to int) ([]int, error) {
+	var out apitypes.ObservedPortsResp
+	path := fmt.Sprintf("/api/v1/ports/observed?host=%s&from=%d&to=%d", url.QueryEscape(host), from, to)
+	if err := c.do("GET", path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Unreserved, nil
 }
 
 func portNum(s string) int {
@@ -286,6 +336,25 @@ func usedPorts(pm apitypes.HostPortMapResponse, host string) map[int]bool {
 	return used
 }
 
+// blockedPorts is what the read-only 'list' suggestions must skip on a host:
+// formal reservations (usedPorts) plus every unexpired claim on that host.
+// Claims on OTHER hosts are ignored.
+func blockedPorts(pm apitypes.HostPortMapResponse, host string) map[int]bool {
+	blocked := usedPorts(pm, host)
+	for _, cl := range pm.Claims {
+		if cl.Host != host {
+			continue
+		}
+		if cl.Proto != "" && cl.Proto != "tcp" {
+			continue
+		}
+		for p := cl.From; p <= cl.To; p++ {
+			blocked[p] = true
+		}
+	}
+	return blocked
+}
+
 // excludedFunc builds the port-denylist predicate from the server-provided
 // exclusions (builtin + custom). Falls back to the CLI's hardcoded common-port
 // list only when an older server returns no exclusions.
@@ -306,28 +375,6 @@ func excludedFunc(pm apitypes.HostPortMapResponse) func(int) bool {
 		}
 		return false
 	}
-}
-
-// findFreeRange returns the lowest base >= from where [base, base+count) is all
-// free — skipping used ports and the excluded denylist.
-func findFreeRange(used map[int]bool, from, count int, excluded func(int) bool) int {
-	if from < 1 {
-		from = 1
-	}
-	for base := from; base+count-1 <= 65535; base++ {
-		free := true
-		for p := base; p < base+count; p++ {
-			if used[p] || excluded(p) {
-				free = false
-				base = p // skip past the conflict
-				break
-			}
-		}
-		if free {
-			return base
-		}
-	}
-	return 0
 }
 
 // suggestFree returns up to count free ports at or above from (never below the

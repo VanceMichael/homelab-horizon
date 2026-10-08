@@ -638,6 +638,46 @@ export interface ObservedPortsResp {
   scanned: boolean;
   note?: string;
 }
+/**
+ * PortClaimResp describes one live claim. Token is populated ONLY in the
+ * mint response: listings blank it, since a listing credential would be a
+ * secret that leaked into terminals and screenshots.
+ */
+export interface PortClaimResp {
+  id: string;
+  host: string;
+  proto: string;
+  from: number /* int */;
+  to: number /* int */;
+  note?: string;
+  created_at: number /* int64 */; // unix seconds
+  expires_at: number /* int64 */; // unix seconds
+  token?: string;
+}
+/**
+ * PortClaimRequest mints one claim. Count is a contiguous span size starting
+ * at or above From; TTLSeconds 0 means the server default.
+ */
+export interface PortClaimRequest {
+  host: string;
+  proto?: string;
+  count?: number /* int */;
+  from?: number /* int */;
+  ttl_seconds?: number /* int */;
+  note?: string;
+}
+/**
+ * PortClaimReleaseRequest returns a leased range early. Release is
+ * idempotent: an already-gone id reports Released=false rather than erroring.
+ */
+export interface PortClaimReleaseRequest {
+  id: string;
+  token: string;
+}
+export interface PortClaimReleaseResponse {
+  ok: boolean;
+  released: boolean;
+}
 export interface ConfigResp {
   publicIP: string;
   publicIPOverride?: string;
@@ -1030,6 +1070,12 @@ export interface HostPortEntry {
 export interface HostPortMapResponse {
   hosts: { [key: string]: HostPortEntry[]};
   exclusions: PortExclusionsResp;
+  /**
+   * Claims are the live short-term leases `hz ports next` mints. They are
+   * not formal reservations: distinct in the CLI/UI and gone at expiry, on
+   * release, or when config adopts their range. Tokens are never present.
+   */
+  claims?: PortClaimResp[];
 }
 /**
  * PortRange is an inclusive [from,to] port span (single port when to<=from).

@@ -13,6 +13,8 @@ import (
 
 	"github.com/iodesystems/homelab-horizon/internal/config"
 	"github.com/iodesystems/homelab-horizon/internal/monitor"
+	"github.com/iodesystems/homelab-horizon/internal/portclaims"
+	"github.com/iodesystems/homelab-horizon/internal/system"
 )
 
 func TestMergeRemoteIntoLocal(t *testing.T) {
@@ -156,6 +158,13 @@ func newTestServer(t *testing.T, cfg *config.Config) *Server {
 		t.Fatalf("save initial config: %v", err)
 	}
 
+	// An in-memory claim store: persistence exercises the dry-run FS layers
+	// without touching the t.TempDir, and each test starts lease-empty.
+	claims, err := portclaims.Open(system.NewDryRunFileSystem(), cfgPath+".portclaims.json")
+	if err != nil {
+		t.Fatalf("open port claim store: %v", err)
+	}
+
 	s := &Server{
 		configPath:    cfgPath,
 		adminToken:    "test-admin",
@@ -165,6 +174,7 @@ func newTestServer(t *testing.T, cfg *config.Config) *Server {
 		health:        &HealthStatus{healthy: true},
 		configShares:  make(map[string]*configShare),
 		installGrants: newInstallGrants(),
+		portClaims:    claims,
 	}
 	s.config.Store(cfg)
 	return s

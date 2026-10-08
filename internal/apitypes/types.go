@@ -641,6 +641,50 @@ type ObservedPortsResp struct {
 	Note    string `json:"note,omitempty"`
 }
 
+// Port claim protocol — short-lived, server-side leases minted atomically by
+// `hz ports next`, so two concurrent callers cannot be handed the same
+// range. A claim survives restart, expires on its own clock, can be released
+// with its credential, and is reaped automatically once config formally
+// adopts the range.
+
+// PortClaimResp describes one live claim. Token is populated ONLY in the
+// mint response: listings blank it, since a listing credential would be a
+// secret that leaked into terminals and screenshots.
+type PortClaimResp struct {
+	ID        string `json:"id"`
+	Host      string `json:"host"`
+	Proto     string `json:"proto"`
+	From      int    `json:"from"`
+	To        int    `json:"to"`
+	Note      string `json:"note,omitempty"`
+	CreatedAt int64  `json:"created_at"` // unix seconds
+	ExpiresAt int64  `json:"expires_at"` // unix seconds
+	Token     string `json:"token,omitempty"`
+}
+
+// PortClaimRequest mints one claim. Count is a contiguous span size starting
+// at or above From; TTLSeconds 0 means the server default.
+type PortClaimRequest struct {
+	Host       string `json:"host"`
+	Proto      string `json:"proto,omitempty"`
+	Count      int    `json:"count,omitempty"`
+	From       int    `json:"from,omitempty"`
+	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+	Note       string `json:"note,omitempty"`
+}
+
+// PortClaimReleaseRequest returns a leased range early. Release is
+// idempotent: an already-gone id reports Released=false rather than erroring.
+type PortClaimReleaseRequest struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
+}
+
+type PortClaimReleaseResponse struct {
+	OK       bool `json:"ok"`
+	Released bool `json:"released"`
+}
+
 type ConfigResp struct {
 	PublicIP            string   `json:"publicIP"`
 	PublicIPOverride    string   `json:"publicIPOverride,omitempty"`
@@ -1056,6 +1100,10 @@ type HostPortEntry struct {
 type HostPortMapResponse struct {
 	Hosts      map[string][]HostPortEntry `json:"hosts"`
 	Exclusions PortExclusionsResp         `json:"exclusions"`
+	// Claims are the live short-term leases `hz ports next` mints. They are
+	// not formal reservations: distinct in the CLI/UI and gone at expiry, on
+	// release, or when config adopts their range. Tokens are never present.
+	Claims []PortClaimResp `json:"claims,omitempty"`
 }
 
 // PortRange is an inclusive [from,to] port span (single port when to<=from).

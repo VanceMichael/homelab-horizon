@@ -24,29 +24,6 @@ func TestIsCommonPort(t *testing.T) {
 	}
 }
 
-func TestFindFreeRangeSkipsUsedAndCommon(t *testing.T) {
-	tests := []struct {
-		name  string
-		used  map[int]bool
-		from  int
-		count int
-		want  int
-	}{
-		{"first free in safe band", map[int]bool{}, 20000, 1, 20000},
-		{"skips a used port", map[int]bool{20000: true}, 20000, 1, 20001},
-		{"skips common port when from lands on it", map[int]bool{}, 8080, 1, 8100},
-		{"contiguous range hops over conflict", map[int]bool{20002: true}, 20000, 3, 20003},
-		{"range avoids common band", map[int]bool{}, 8098, 3, 8100},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := findFreeRange(tt.used, tt.from, tt.count, isCommonPort); got != tt.want {
-				t.Errorf("findFreeRange(from=%d,count=%d) = %d, want %d", tt.from, tt.count, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestSuggestFree(t *testing.T) {
 	used := map[int]bool{20000: true, 20001: true}
 	got := suggestFree(used, 20000, 3, isCommonPort)
@@ -75,5 +52,29 @@ func TestUsedTCPExcludesUDP(t *testing.T) {
 	}
 	if used[53] || used[51820] {
 		t.Errorf("udp ports must not block tcp allocation: %v", used)
+	}
+}
+
+func TestBlockedPortsIncludesClaimsOnSameHostOnly(t *testing.T) {
+	pm := apitypes.HostPortMapResponse{
+		Hosts: map[string][]apitypes.HostPortEntry{
+			"h": {{Port: "21000", Proto: "tcp", Service: "svc"}},
+		},
+		Claims: []apitypes.PortClaimResp{
+			{ID: "pc_a", Host: "h", Proto: "tcp", From: 22000, To: 22002},
+			{ID: "pc_b", Host: "other", Proto: "tcp", From: 23000, To: 23000},
+		},
+	}
+	blocked := blockedPorts(pm, "h")
+	if !blocked[21000] {
+		t.Error("formal reservation missing from blocked set")
+	}
+	for _, p := range []int{22000, 22001, 22002} {
+		if !blocked[p] {
+			t.Errorf("claimed port %d must block suggestions", p)
+		}
+	}
+	if blocked[23000] {
+		t.Error("a claim on another host must not block this host's suggestions")
 	}
 }

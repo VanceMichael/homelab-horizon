@@ -56,10 +56,14 @@ COMMANDS
   setup                              Interactive questionnaire -> create + sync
   sync [--wait]                      Trigger a global sync (--wait: block til done)
   pending                            Show unsynced config changes
-  ports next --host IP [--count N] [--from PORT]
-                                     Find the next free port range on a host (safe band, common ports skipped)
+  ports next --host IP [--count N] [--from PORT] [--ttl DUR]
+                                     Atomically claim the next free port range on a
+                                     host and hold it (default 10m); prints the bare
+                                     port(s), claim credential goes to stderr
   ports list --host IP [--count N] [--from PORT]
-                                     List reserved ports on a host + suggested free ports
+                                     List formal reservations, temporary claims,
+                                     listening-but-unregistered ports + suggestions
+  ports release --id ID --token TOK  Release a claim before its TTL (idempotent)
   domain list [--json]               List every known domain: service, zone, HTTPS coverage, cert
   domain ssl add <domain>...         Give domains HTTPS (adds the SubZone that covers them)
   domain ssl rm <domain>... --confirm

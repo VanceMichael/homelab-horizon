@@ -12,6 +12,7 @@ import (
 type FileSystem interface {
 	ReadFile(path string) ([]byte, error)
 	WriteFile(path string, data []byte, perm os.FileMode) error
+	Rename(oldpath, newpath string) error
 	Stat(path string) (os.FileInfo, error)
 	Exists(path string) bool
 	Remove(path string) error
@@ -42,6 +43,10 @@ func (fs *RealFileSystem) ReadFile(path string) ([]byte, error) {
 
 func (fs *RealFileSystem) WriteFile(path string, data []byte, perm os.FileMode) error {
 	return os.WriteFile(path, data, perm)
+}
+
+func (fs *RealFileSystem) Rename(oldpath, newpath string) error {
+	return os.Rename(oldpath, newpath)
 }
 
 func (fs *RealFileSystem) Stat(path string) (os.FileInfo, error) {
@@ -133,6 +138,7 @@ type DryRunFileSystem struct {
 	created map[string]bool
 	removed map[string]bool
 	mkdirs  map[string]bool
+	renamed map[string]string // oldpath -> newpath
 }
 
 func NewDryRunFileSystem() *DryRunFileSystem {
@@ -142,6 +148,7 @@ func NewDryRunFileSystem() *DryRunFileSystem {
 		created: make(map[string]bool),
 		removed: make(map[string]bool),
 		mkdirs:  make(map[string]bool),
+		renamed: make(map[string]string),
 	}
 }
 
@@ -164,6 +171,23 @@ func (fs *DryRunFileSystem) WriteFile(path string, data []byte, perm os.FileMode
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.written[path] = data
+	return nil
+}
+
+// Rename emulates os.Rename over the in-memory layers: a pending write (or a
+// seeded file) moves to newpath. Entries that only exist on the real disk are
+// recorded for assertion and left there, as every dry-run op is.
+func (fs *DryRunFileSystem) Rename(oldpath, newpath string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if data, ok := fs.written[oldpath]; ok {
+		delete(fs.written, oldpath)
+		fs.written[newpath] = data
+	} else if data, ok := fs.files[oldpath]; ok {
+		delete(fs.files, oldpath)
+		fs.files[newpath] = data
+	}
+	fs.renamed[oldpath] = newpath
 	return nil
 }
 
@@ -251,6 +275,16 @@ func (fs *DryRunFileSystem) GetCreatedDirs() map[string]bool {
 	defer fs.mu.Unlock()
 	result := make(map[string]bool)
 	for k, v := range fs.mkdirs {
+		result[k] = v
+	}
+	return result
+}
+
+func (fs *DryRunFileSystem) GetRenamedFiles() map[string]string {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	result := make(map[string]string, len(fs.renamed))
+	for k, v := range fs.renamed {
 		result[k] = v
 	}
 	return result
